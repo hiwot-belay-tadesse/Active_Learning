@@ -1,0 +1,26 @@
+# Install into a dedicated virtualenv -- NOT into an existing scientific env:
+#
+#     python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+#
+# scikit-activeml 1.0 requires scikit-learn >= 1.6, which in turn pulls numpy 2.x. Installing
+# it alongside an older stack (e.g. sklearn 1.2 / numpy 1.x / TensorFlow 2.19) will silently
+# upgrade both and break that stack, which is why this project keeps its own venv.
+#
+# Direct dependencies only. Versions are lower bounds at the ones this code was developed
+# against; transitive packages are left to the resolver.
+
+scikit-activeml>=1.0.1      # pool-based acquisition strategies (CoreSet, TypiClust, ProbCover)
+scikit-learn>=1.6           # preprocessing pipeline, metrics, KMeans behind TypiClust
+statsmodels>=0.15           # BinomialBayesMixedGLM -- the mixed-effects classifier
+numpy>=2.0
+pandas>=2.0
+scipy>=1.13
+matplotlib>=3.9             # plots/ only; the run itself does not import it
+
+# Developed and verified with:
+#   skactiveml 1.0.1, scikit-learn 1.9.1, statsmodels 0.15.0,
+#   numpy 2.4.6, pandas 3.1.1, scipy 1.17.1, matplotlib 3.11.2, Python 3.11
+#
+# Pin these exactly if you need to reproduce published numbers: TypiClust's default k and
+# statsmodels' MAP optimiser have both changed across releases, so results are version
+# sensitive. Every run also records the versions it used in its own config.json.

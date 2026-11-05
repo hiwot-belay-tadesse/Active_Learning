@@ -1,0 +1,30 @@
+# Environment -- rebuild from requirements.txt, never commit it
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Results: every run writes per-split CSVs, derived tables and figures under results/.
+# They are reproducible from the code plus the data, and they grow without bound, so the
+# whole tree stays out of git -- including results/index.csv, which is rebuilt on each run.
+results/
+
+# Data is never copied into the repo. The 61 ExtraSensory *.features_labels.csv files
+# (748 MB) are referenced in place through ES_DATA_DIR; see README.
+*.features_labels.csv
+DATA/
+data/
+
+# Stray outputs from ad-hoc work
+*.png
+*.pdf
+*.npz
+*.pkl
+*.log
+
+# macOS / editors
+.DS_Store
+.ipynb_checkpoints/
+.vscode/
+.idea/
