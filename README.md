@@ -9,22 +9,29 @@ the pool. The questions: does a smarter acquisition beat random, and whose label
 
 ## Setup
 
+Assumes the micromamba env `Ban` already exists.
+
 ```bash
-python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+micromamba activate Ban
+pip install -r requirements.txt
 export ES_DATA_DIR=/path/to/ExtraSensory      # the 61 *.features_labels.csv files
 ```
 
-Data is never copied into the repo. scikit-activeml needs scikit-learn >= 1.6, so use a
-dedicated venv rather than an existing scientific environment.
+Data is never copied into the repo.
+
+> scikit-activeml 1.0 requires scikit-learn >= 1.6, which pulls numpy 2.x. If `Ban` also holds
+> an older stack (scikit-learn 1.2 / numpy 1.x / TensorFlow 2.19), this install upgrades both
+> and breaks it. Use a separate env (`micromamba create -n AL python=3.11`) if that stack still
+> matters.
 
 ## Run
 
 ```bash
-./.venv/bin/python main.py                                   # computer_work, W=15, typiclust vs random
-./.venv/bin/python main.py --methods coreset probcover random --splits 3
-./.venv/bin/python reference_models.py --contains r10x3      # 100%-label references
-./.venv/bin/python plots/per_person_grid.py --contains r10x3 # the per-participant grid
-./.venv/bin/python paths.py                                  # list every run
+python main.py                                   # computer_work, W=15, typiclust vs random
+python main.py --methods coreset probcover random --splits 3
+python reference_models.py --contains r10x3      # 100%-label references
+python plots/per_person_grid.py --contains r10x3 # the per-participant grid
+python paths.py                                  # list every run
 ```
 
 ## Files

@@ -1,10 +1,10 @@
-# Install into a dedicated virtualenv -- NOT into an existing scientific env:
+# Install into the micromamba env used for this project:
 #
-#     python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+#     micromamba activate Ban && pip install -r requirements.txt
 #
 # scikit-activeml 1.0 requires scikit-learn >= 1.6, which in turn pulls numpy 2.x. Installing
 # it alongside an older stack (e.g. sklearn 1.2 / numpy 1.x / TensorFlow 2.19) will silently
-# upgrade both and break that stack, which is why this project keeps its own venv.
+# upgrade both and break that stack -- give this project its own env if that matters.
 #
 # Direct dependencies only. Versions are lower bounds at the ones this code was developed
 # against; transitive packages are left to the resolver.
