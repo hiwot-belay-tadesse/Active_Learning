@@ -104,8 +104,13 @@ def main():
     D = load_run(run, "per_round")
     cfg = read_config(run) if os.path.exists(os.path.join(run, "config.json")) else {}
 
+    # `first_split` is deliberately NOT here. Under the cluster fan-out each split is its own
+    # job writing into the shared run folder, and every one of them rewrites config.json with
+    # its own --first_split, so the stored value is whichever job happened to finish last. It
+    # describes no property of the finished run. What actually has to match is the set of
+    # splits present, which is checked below against the CSVs on disk rather than the config.
     SAME = ["target", "block", "n_slopes", "fe_p", "vcp_p", "n_seed", "n_seed_pos",
-            "rounds", "batch", "first_split"]
+            "rounds", "batch"]
     merged = []
     for other in (a.also or []):
         ocfg = read_config(other)
@@ -114,6 +119,14 @@ def main():
             raise SystemExit(f"{os.path.basename(other)} differs on {bad}; curves would not be "
                              f"comparable")
         E = load_run(other, "per_round")
+        shared = sorted(set(D.split) & set(E.split))
+        if set(D.split) != set(E.split):
+            print(f"  note: {os.path.basename(other)} has splits {sorted(set(E.split))} vs "
+                  f"{sorted(set(D.split))} here; restricting both to the {len(shared)} shared")
+            if not shared:
+                raise SystemExit(f"{os.path.basename(other)} shares no split with the run")
+            D = D[D.split.isin(shared)]
+            E = E[E.split.isin(shared)]
         E = E[~E.method.isin(set(D.method))]
         if len(E):
             import pandas as pd
