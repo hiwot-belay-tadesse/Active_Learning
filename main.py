@@ -37,7 +37,8 @@ import numpy as np
 import pandas as pd
 
 from load_data import get_target, load
-from paths import done_splits, run_dir, split_files, update_index, write_config
+from paths import (analysis_path, done_splits, run_dir, split_files, update_index,
+                   write_config)
 from preprocess_data import canonical_ids, prepare_one
 from utility import (MixedEffectsClassifier, attach_person, scores, seed_set, select_slopes)
 
@@ -229,6 +230,14 @@ def main():
     ap.add_argument("--reserve", action="store_true",
                     help="never write into a folder that already holds results")
     ap.add_argument("--resume", action="store_true", help="skip splits already written")
+    ap.add_argument("--refs", action="store_true",
+                    help="also fit the 100%% -label reference models for each split and write "
+                         "analysis/reference_auroc_split<k>.csv, then merge them with "
+                         "`python reference_models.py --run <folder> --merge`. The references "
+                         "are method-INDEPENDENT -- they depend on the split, the block and "
+                         "the priors, not on the acquisition -- so turn this on for exactly "
+                         "ONE queue entry, or the same slow fits are repeated once per method. "
+                         "A split whose CSV already exists is skipped, so resubmitting is free.")
     ap.add_argument("--no_index", action="store_true",
                     help="do not touch results/index.csv -- for parallel jobs, which would "
                          "otherwise race on one file; run `python paths.py --reindex` after")
@@ -258,6 +267,18 @@ def main():
     # the numbering every existing run already uses, so no finished result changes.
     ids = canonical_ids(data)
     for k in range(args.first_split, args.first_split + args.splits):
+        # References first, and OUTSIDE the resume check: the AL curves and the reference
+        # models are written independently, so a run whose splits finished before --refs
+        # existed can be resubmitted to fill in just the references.
+        if args.refs:
+            ref_csv = analysis_path(out, f"reference_auroc_split{k}.csv")
+            if os.path.exists(ref_csv):
+                print(f"  split {k}: references already written, skipping", flush=True)
+            else:
+                from reference_models import references_for_split      # noqa: PLC0415
+                rows, ids = references_for_split(data, cols, k, cfg, ids)
+                pd.DataFrame(rows).to_csv(ref_csv, index=False)
+                print(f"  split {k}: references -> {ref_csv}", flush=True)
         if k in have:
             continue
         R, Q, ids = run_split(data, cols, k, args, ids)

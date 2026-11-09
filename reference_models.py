@@ -34,6 +34,7 @@ Writes ``analysis/reference_auroc.csv`` inside the run (split, target, model, au
 which plots/per_person_grid.py picks up automatically.
 """
 import argparse
+import glob
 import os
 import sys
 import time
@@ -145,7 +146,31 @@ def main():
                     help="skip the slow mixed fit; merge into an existing reference CSV")
     ap.add_argument("--with_unpenalised", action="store_true",
                     help="also fit the unpenalised pooled GLM (global_full), as a diagnostic")
+    ap.add_argument("--out", default="reference_auroc.csv",
+                    help="file name inside <run>/analysis/. A SLURM array gives each task its "
+                         "own name so the tasks never write the same file; `--merge` then "
+                         "combines them. Writing one shared file from several jobs is a "
+                         "read-modify-write race and loses rows.")
+    ap.add_argument("--merge", action="store_true",
+                    help="combine <run>/analysis/reference_auroc_split*.csv into "
+                         "reference_auroc.csv and exit, fitting nothing")
     a = ap.parse_args()
+
+    if a.merge:
+        run = a.run or find_run(a.target, a.contains)
+        parts = sorted(glob.glob(analysis_path(run, "reference_auroc_split*.csv")))
+        if not parts:
+            raise SystemExit(f"no reference_auroc_split*.csv under {run}/analysis")
+        R = pd.concat([pd.read_csv(f) for f in parts], ignore_index=True) \
+              .drop_duplicates(["split", "target", "model"], keep="last")
+        out = analysis_path(run, "reference_auroc.csv")
+        R.to_csv(out, index=False)
+        print(f"merged {len(parts)} file(s), splits {sorted(R.split.unique())} -> {out}")
+        m = R.pivot_table(index="target", columns="model", values="auroc")
+        for name in ("mixed_full", "global_prior", "global_full", "global_sklearn"):
+            if name in m:
+                print(f"  {name:15s} {m[name].mean():.4f}")
+        return
 
     run = a.run or find_run(a.target, a.contains)
     cfg = read_config(run)
@@ -162,7 +187,7 @@ def main():
         r, ids = references_for_split(data, cols, k, cfg, ids)
         rows += r
     R = pd.DataFrame(rows)
-    out = analysis_path(run, "reference_auroc.csv")
+    out = analysis_path(run, a.out)
     if os.path.exists(out):                       # keep models this call did not recompute
         old = pd.read_csv(out)
         old = old[~old.model.isin(set(R.model)) | ~old.split.isin(set(R.split))]

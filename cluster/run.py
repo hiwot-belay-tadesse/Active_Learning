@@ -62,7 +62,10 @@ N_SPLITS = 20
 QUEUE = [
     # ("smoke", dict(split=[0], methods=["random"],
     #             rounds=[1], max_targets=[3], tag=["smoke"])),
-    ("random",    dict(split=list(range(N_SPLITS)), methods=["random"])),
+    # `refs=1` only here: the 100%-label reference models depend on the split and the priors,
+    # not on the acquisition, so one entry computes them for everyone. They land in THIS run's
+    # analysis/ and the grid reads them from there with `--refs`.
+    ("random",    dict(split=list(range(N_SPLITS)), methods=["random"], refs=[1])),
     ("eu",        dict(split=list(range(N_SPLITS)), methods=["laplace"])),
     # ("eer",       dict(split=list(range(N_SPLITS)), methods=["eer"])),
     ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
@@ -105,8 +108,16 @@ def command(exp_kwargs):
             # read-modify-write of a single file. Rebuild it once afterwards with
             #     python paths.py --reindex
             "--no_index"]
+    # main.py declares these with action="store_true", so they take NO value: emitting
+    # `--refs 1` makes argparse fail with "unrecognized arguments: 1". A falsy value omits
+    # the flag entirely rather than passing --refs 0, which would also switch it on.
+    FLAGS = {"refs", "resume", "no_index", "reserve"}
     for k, v in kw.items():
         if k == "split":
+            continue
+        if k in FLAGS:
+            if v:
+                argv += [f"--{k}"]
             continue
         argv += [f"--{k}", str(v)]
     return argv
