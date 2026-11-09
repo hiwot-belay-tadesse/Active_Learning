@@ -156,6 +156,29 @@ def update_index(path, cfg=None, root=RESULTS_ROOT):
     return idx
 
 
+def reindex(root=RESULTS_ROOT):
+    """Rebuild results/index.csv from the run folders actually on disk. -> the index frame.
+
+    update_index() only adds and refreshes, so a deleted run keeps its row forever. This drops
+    the whole index and walks ``<root>/<target>/<run>/config.json`` instead, which both prunes
+    stale rows and repairs an index that parallel jobs raced on. Runs are written with
+    ``--no_index`` on the cluster precisely so this is called once, after the array drains.
+    """
+    if os.path.exists(INDEX):
+        os.remove(INDEX)
+    found = []
+    for target in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        tdir = os.path.join(root, target)
+        if not os.path.isdir(tdir):
+            continue
+        for name in sorted(os.listdir(tdir)):
+            path = os.path.join(tdir, name)
+            if os.path.exists(os.path.join(path, "config.json")):
+                update_index(path, root=root)
+                found.append(name)
+    return runs(root=root), found
+
+
 def runs(target=None, root=RESULTS_ROOT):
     """Every indexed run, optionally filtered -- the "what do I have?" call."""
     if not os.path.exists(INDEX):
@@ -179,7 +202,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", default=None)
+    ap.add_argument("--reindex", action="store_true",
+                    help="rebuild index.csv from the folders on disk (prunes deleted runs)")
     a = ap.parse_args()
+    if a.reindex:
+        _, found = reindex()
+        print(f"reindexed {len(found)} run(s)")
     idx = runs(a.target)
     print(f"results root: {RESULTS_ROOT}")
     print(idx.to_string(index=False) if len(idx) else "(no runs indexed yet)")

@@ -275,14 +275,18 @@ class MixedEffectsClassifier(SkactivemlClassifier):
                  missing_label=MISSING_LABEL, cost_matrix=None, random_state=None):
         super().__init__(classes=classes, missing_label=missing_label, cost_matrix=cost_matrix,
                          random_state=random_state)
-        self.persons = list(persons)
-        self.slope_idx = list(slope_idx)
+        # stored verbatim: sklearn's clone() (used by scikit-activeml strategies that refit
+        # the model, e.g. expected error reduction) requires get_params() to return exactly
+        # what was passed, so no list()/copy conversions here -- do them where they are used
+        self.persons = persons
+        self.slope_idx = slope_idx
         self.fe_p, self.vcp_p = fe_p, vcp_p
 
     # -- internals -----------------------------------------------------------
     def _split(self, X):
         X = np.asarray(X, float)
-        return X[:, :-1], [self.persons[int(c)] for c in X[:, -1]]
+        persons = list(self.persons)
+        return X[:, :-1], [persons[int(c)] for c in X[:, -1]]
 
     def fit(self, X, y, sample_weight=None):
         Z, person = self._split(X)
@@ -302,7 +306,7 @@ class MixedEffectsClassifier(SkactivemlClassifier):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                self.res_ = fit_mixed(df, feats, vc_formulas(self.slope_idx),
+                self.res_ = fit_mixed(df, feats, vc_formulas(list(self.slope_idx)),
                                       vcp_p=self.vcp_p, fe_p=self.fe_p)
                 self.vc_ = parse_vc(self.res_)
             except Exception:
@@ -318,7 +322,7 @@ class MixedEffectsClassifier(SkactivemlClassifier):
         lo = logit_fixed(self.res_, Z)
         for p in set(person):
             m = np.array([q == p for q in person])
-            lo[m] = lo[m] + random_part(self.vc_, p, Z[m], self.slope_idx)
+            lo[m] = lo[m] + random_part(self.vc_, p, Z[m], list(self.slope_idx))
         return lo
 
     def predict_proba(self, X):

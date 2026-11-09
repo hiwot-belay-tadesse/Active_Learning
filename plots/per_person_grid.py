@@ -11,8 +11,10 @@ over all targets.
 
 Read the ordering with care. Sorting panels by a noisy quantity always produces a left-to-right
 gradient, so the leading panels look good even when every participant has the same true gap.
-The title line reports the split-half rank correlation of the per-person gap, which is the
-quick check on whether that ordering means anything: near zero says the ranking is luck.
+The run summary printed to stdout reports the split-half rank correlation of the per-person
+gap, which is the quick check on whether that ordering means anything: near zero says the
+ranking is luck. The figure itself carries no title -- the series legend sits there instead --
+so the configuration it came from is recorded in the run's ``config.json``, not on the plot.
 
 Two dashed reference lines are drawn per panel when ``analysis/reference_auroc.csv`` exists
 (written by reference_models.py), both fitted on 100% of the split's labels:
@@ -44,7 +46,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import figure_path, find_run, load_run, read_config           # noqa: E402
 
 COL = {"typiclust": "purple", "coreset": "seagreen", "random": "darkorange",
-       "probcover": "teal", "uncertainty": "steelblue"}
+       "probcover": "dodgerblue", "uncertainty": "steelblue", "eer": "magenta",
+       "laplace": "black", "laplace_var": "gold"}
+
+# Display names. The method STRING stays as it is written in the per-round CSVs and the run
+# folder name -- renaming it there would orphan every finished run -- so the relabelling is
+# cosmetic and lives only here. `--order_by` and `--methods` still take the real name.
+LABEL = {"laplace": "EU", "laplace_var": "EU (own variance)"}
 
 
 def split_half_rho(G, n=200, seed=0):
@@ -74,20 +82,47 @@ def main():
     ap.add_argument("--run", default=None, help="path to a run folder; default = newest indexed")
     ap.add_argument("--target", default="computer_work", help="used when --run is omitted")
     ap.add_argument("--contains", default=None, help="narrow the run lookup by folder substring")
+    ap.add_argument("--also", nargs="*", default=None,
+                    help="other run folders whose methods to overlay. Only legitimate when the "
+                         "runs share target, block, slopes, priors, seed set and splits -- the "
+                         "seed sets are keyed on (seed, split, participant), so curves from "
+                         "such runs are paired, not independent. Checked below; methods already "
+                         "present are skipped, so `random` is taken from the primary run.")
     ap.add_argument("--rows", type=int, default=4, help="panel rows; columns follow")
+    ap.add_argument("--order_by", default=None,
+                    help="method whose gap over random orders the panels (default: the first "
+                         "non-random method present)")
     ap.add_argument("--refs", default=None,
                     help="reference CSV; default = <run>/analysis/reference_auroc.csv if present")
     ap.add_argument("--no_refs", action="store_true", help="draw the curves only")
     ap.add_argument("--show_unpenalised", action="store_true",
                     help="also draw global_full, the unpenalised pooled fit")
-    ap.add_argument("--out", default="per_person_grid.png")
+    ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     run = a.run or find_run(a.target, a.contains)
     D = load_run(run, "per_round")
     cfg = read_config(run) if os.path.exists(os.path.join(run, "config.json")) else {}
+
+    SAME = ["target", "block", "n_slopes", "fe_p", "vcp_p", "n_seed", "n_seed_pos",
+            "rounds", "batch", "first_split"]
+    merged = []
+    for other in (a.also or []):
+        ocfg = read_config(other)
+        bad = [k for k in SAME if cfg.get(k) != ocfg.get(k)]
+        if bad:
+            raise SystemExit(f"{os.path.basename(other)} differs on {bad}; curves would not be "
+                             f"comparable")
+        E = load_run(other, "per_round")
+        E = E[~E.method.isin(set(D.method))]
+        if len(E):
+            import pandas as pd
+            D = pd.concat([D, E], ignore_index=True)
+            merged += sorted(set(E.method))
+    if merged:
+        print(f"overlaid {', '.join(merged)} from {len(a.also)} other run(s)")
     methods = [m for m in D.method.unique()]
-    alt = next((m for m in methods if m != "random"), None)
+    alt = a.order_by or next((m for m in methods if m != "random"), None)
     if alt is None or "random" not in methods:
         raise SystemExit(f"need an acquisition and random in the run; found {methods}")
     R = D["round"].max()
@@ -102,9 +137,10 @@ def main():
     rho = split_half_rho(G)
 
     REF = None
-    REFCOL = {"mixed_full": "crimson", "global_prior": "slategrey"}
+    REFCOL = {"mixed_full": "crimson", "global_prior": "slategrey",
+              "global_sklearn": "gold"}
     if a.show_unpenalised:
-        REFCOL["global_full"] = "darkseagreen"
+        REFCOL["global_full"] = "olive"
     rpath = a.refs or os.path.join(run, "analysis", "reference_auroc.csv")
     if not a.no_refs and os.path.exists(rpath):
         import pandas as pd
@@ -126,7 +162,7 @@ def main():
             per = g.pivot_table(index="split", columns="acquired", values="auroc")
             mu = per.mean()
             se = per.std(ddof=1) / np.sqrt(per.notna().sum())
-            ax.plot(mu.index, mu.values, color=COL.get(m, "grey"), lw=1.4, label=m)
+            ax.plot(mu.index, mu.values, color=COL.get(m, "grey"), lw=1.4, label=LABEL.get(m, m))
             ax.fill_between(mu.index, mu - se, mu + se, color=COL.get(m, "grey"),
                             alpha=0.18, lw=0)
         if REF is not None:
@@ -150,14 +186,16 @@ def main():
         ax.set_xlabel("labels acquired", fontsize=8)
     for ax in axes[:, 0]:
         ax.set_ylabel("test AUROC", fontsize=8)
-    axes[0, 0].legend(fontsize=7, loc="lower right")
-
+    # The legend sits across the top of the figure, where a suptitle would otherwise go, so the
+    # series are named once instead of inside one panel. Handles come from the first panel
+    # because that is the only one given reference-line labels (see the axhline call above).
     rho_txt = "n/a (<4 splits)" if not np.isfinite(rho) else f"{rho:+.2f}"
-    fig.suptitle(f"{cfg.get('target', a.target)} — {alt} vs random, W={cfg.get('block', '?')}, "
-                 f"mean over {nsplit} split(s) ±1 SE; panel title = gap at {R} rounds; "
-                 f"split-half rank ρ of the gap = {rho_txt}", fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    out = figure_path(run, a.out)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0),
+               ncol=len(labels), fontsize=9, frameon=False)   # one row, left to right
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    out = figure_path(run, a.out or ("per_person_grid_merged.png" if merged
+                                     else "per_person_grid.png"))
     fig.savefig(out, dpi=160, bbox_inches="tight", facecolor="white")
     print(f"{nsplit} split(s), {D.target.nunique()} targets, rounds 0-{R}")
     print(f"mean gap {gap.mean():+.4f} (SE {gap.std(ddof=1) / np.sqrt(len(gap)):.4f}), "

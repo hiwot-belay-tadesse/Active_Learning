@@ -15,6 +15,10 @@ Two models, both fitted on 100% of the split's training labels -- no active lear
   global_full  the same pooled model unpenalised, computed only with --with_unpenalised. Worth
                a look once: on COMPUTER_WORK the prior halves the coefficient norm (10.3 -> 5.3)
                for +0.005 test AUROC, so the plain fit overfits mildly.
+  global_sklearn  a plain scikit-learn LogisticRegression(penalty=None) on the same pooled rows,
+               always computed. Mathematically the same estimator as global_full -- it is there
+               as an independent implementation, so the two agreeing is a check on the
+               statsmodels path rather than new information about the data.
 
 Together they bracket the curves. A target whose AL curve sits below `global_full` is being
 hurt by personalisation on few labels; one that reaches `mixed_full` with 33 labels has nothing
@@ -57,6 +61,20 @@ def fit_global_prior(df, feats, fe_p, n):
     mod = sm.GLM.from_formula("y ~ " + " + ".join(feats), data=df, family=sm.families.Binomial())
     return mod.fit_regularized(alpha=1.0 / (n * fe_p ** 2), L1_wt=0.0)
 
+
+def fit_global_sklearn(df, feats, max_iter=2000):
+    """Plain pooled logistic regression with scikit-learn -> (intercept, coef).
+
+    `penalty=None` makes it genuinely unregularised. scikit-learn's DEFAULT is L2 with C=1.0,
+    which would be a third penalised model rather than the plain fit asked for, so it is set
+    explicitly here. Same rows, same standardised features and same intercept as the statsmodels
+    fits, so the three pooled models differ only in solver and penalty.
+    """
+    from sklearn.linear_model import LogisticRegression
+    clf = LogisticRegression(penalty=None, max_iter=max_iter)
+    clf.fit(df[feats].to_numpy(float), df["y"].to_numpy(float))
+    return float(clf.intercept_[0]), clf.coef_[0].astype(float)
+
 warnings.filterwarnings("ignore")
 
 
@@ -71,10 +89,12 @@ def references_for_split(data, cols, split_id, cfg, ids=None):
     fe_p = cfg.get("fe_p", 1.0)
     g = fit_global(df, feats)
     gp = fit_global_prior(df, feats, fe_p, len(df))
+    sk_b0, sk_beta = fit_global_sklearn(df, feats)
     fe_g, fe_gp = np.asarray(g.params, float), np.asarray(gp.params, float)
     print(f"  split {split_id}: global GLMs on {len(df)} rows in {time.time() - t0:.0f}s "
           f"(||beta|| {np.linalg.norm(fe_g[1:]):.1f} unpenalised vs "
-          f"{np.linalg.norm(fe_gp[1:]):.1f} with the fe_p={fe_p} prior)", flush=True)
+          f"{np.linalg.norm(fe_gp[1:]):.1f} with the fe_p={fe_p} prior, "
+          f"{np.linalg.norm(sk_beta):.1f} sklearn unpenalised)", flush=True)
 
     if cfg.get("_only_global"):
         res = vc = None
@@ -96,7 +116,8 @@ def references_for_split(data, cols, split_id, cfg, ids=None):
     for u in sp.users:
         Zte, yte = sp.test_of(u)
         pid = sp.ids[u]
-        out = {"global_prior": fe_gp[0] + Zte @ fe_gp[1:]}
+        out = {"global_prior": fe_gp[0] + Zte @ fe_gp[1:],
+               "global_sklearn": sk_b0 + Zte @ sk_beta}
         if cfg.get("_with_unpenalised"):
             out["global_full"] = fe_g[0] + Zte @ fe_g[1:]
         if res is not None:
@@ -152,7 +173,8 @@ def main():
     print(f"\nmean over {len(splits)} split(s) and {len(m)} targets:")
     for name, note in (("mixed_full", "personalised, 100% of labels"),
                        ("global_prior", "pooled, same fe_p prior as the mixed model"),
-                       ("global_full", "pooled, unpenalised")):
+                       ("global_full", "pooled, unpenalised (statsmodels)"),
+                       ("global_sklearn", "pooled, plain sklearn LogisticRegression")):
         if name in m:
             print(f"  {name:13s} {m[name].mean():.4f}   ({note})")
     if "mixed_full" in m and "global_prior" in m:

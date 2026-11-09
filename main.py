@@ -38,7 +38,7 @@ import pandas as pd
 
 from load_data import get_target, load
 from paths import done_splits, run_dir, split_files, update_index, write_config
-from preprocess_data import prepare_one
+from preprocess_data import canonical_ids, prepare_one
 from utility import (MixedEffectsClassifier, attach_person, scores, seed_set, select_slopes)
 
 # ----------------------------------------------------------------------------- defaults
@@ -51,7 +51,7 @@ N_SLOPES = 5                  # features given a per-participant random slope
 TYPICLUST_K = 20              # kNN used for typicality (scikit-activeml's default is 5)
 
 
-def build_strategy(name, seed, typiclust_k=TYPICLUST_K):
+def build_strategy(name, seed, typiclust_k=TYPICLUST_K, eer_candidates=50):
     """-> a scikit-activeml pool strategy. All three ignore the classifier and use the pool only.
 
     Note the defaults differ from a hand-rolled implementation: TypiClust's `k` is 5 upstream,
@@ -59,7 +59,8 @@ def build_strategy(name, seed, typiclust_k=TYPICLUST_K):
     explicitly here. CoreSet is the k-centre greedy of Sener & Savarese (2018); TypiClust is
     Hacohen, Dekel & Weinshall (2022).
     """
-    from skactiveml.pool import CoreSet, ProbCover, RandomSampling, TypiClust
+    from skactiveml.pool import (CoreSet, MonteCarloEER, ProbCover, RandomSampling,
+                                 SubSamplingWrapper, TypiClust)
     if name == "random":
         return RandomSampling(random_state=seed)
     if name == "coreset":
@@ -72,6 +73,22 @@ def build_strategy(name, seed, typiclust_k=TYPICLUST_K):
         # to cover nearly everything, at which point the picks are close to random -- worth
         # checking the chosen delta before reading much into a null result
         return ProbCover(n_classes=2, random_state=seed)
+    if name == "eer":
+        # Expected error reduction refits the model twice per candidate (once per possible
+        # label), so the full pool would be ~22k refits per round. SubSamplingWrapper draws
+        # max_candidates of them at random first, which is the only thing that makes it
+        # runnable; the result approximates the full criterion on that subsample.
+        return SubSamplingWrapper(
+            query_strategy=MonteCarloEER(method="misclassification_loss", random_state=seed),
+            max_candidates=eer_candidates, random_state=seed)
+    if name in ("laplace", "laplace_var"):
+        # Our own strategy: variance reduction under the mixed model's Laplace posterior. The
+        # library has nothing posterior-aware for this estimator (EpistemicUncertaintySampling
+        # is isinstance-locked to ParzenWindowClassifier / LogisticRegression). Label-free and
+        # closed-form, so unlike eer it scores the WHOLE pool -- no SubSamplingWrapper.
+        from laplace_variance import LaplaceVarianceReduction
+        return LaplaceVarianceReduction(
+            criterion="variance" if name == "laplace_var" else "reduction", random_state=seed)
     raise ValueError(f"unknown acquisition {name!r}")
 
 
@@ -92,17 +109,47 @@ def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
     Xte = attach_person(Zte, [tgt_uuid] * len(yte), sp.users)
     n_pos_te = int(np.sum(yte == 1))
 
+    CLF_STRATEGIES = {"eer"}
+    # Laplace variance reduction is model-based too, but takes the OWNER-coded matrix, not the
+    # target-coded one: its criterion reads the candidate's own random-effect columns, so
+    # recoding every candidate as the target (what eer needs) would erase exactly the
+    # provenance term that makes it interesting. See laplace_variance.py, `Candidate coding`.
+    LAPLACE_STRATEGIES = {"laplace", "laplace_var"}
     rows, queries = [], []
     for method in args.methods:
-        qs = build_strategy(method, args.seed + split_id, args.typiclust_k)
+        qs = build_strategy(method, args.seed + split_id, args.typiclust_k, args.eer_candidates)
         y_al = np.full(len(sp.y), np.nan)
         y_al[seed_rows] = sp.y[seed_rows]
         bought = []
+        clf = MixedEffectsClassifier(persons=sp.users, slope_idx=slope_idx, fe_p=args.fe_p,
+                                     vcp_p=args.vcp_p, classes=[0.0, 1.0], missing_label=np.nan)
         for rnd in range(args.rounds + 1):
             if rnd > 0:
                 # scikit-activeml queries the pool by index; the FEATURES go in, never the
                 # person column -- a participant code is not a coordinate to measure distance in
-                idx = qs.query(X=sp.Z, y=y_al, batch_size=args.batch)
+                if method in LAPLACE_STRATEGIES:
+                    own_unl = own[np.isnan(y_al[own])]
+                    # fit_clf=False: `clf` below was already fitted on (Xclf, y_al) at the end
+                    # of the previous round, so refitting here would just repeat it.
+                    idx = qs.query(X=Xclf, y=y_al, clf=clf, fit_clf=False,
+                                   X_eval=Xclf[own_unl] if len(own_unl) else None,
+                                   batch_size=args.batch)
+                elif method in CLF_STRATEGIES:
+                    # the model reads the participant code from the last column, so a
+                    # model-based strategy must be given that matrix -- and every candidate is
+                    # coded as the TARGET, i.e. "how much would this label reduce error for
+                    # THIS participant", not for whoever happens to own the block.
+                    Xq = attach_person(sp.Z, [tgt_uuid] * len(sp.Z), sp.users)
+                    own_unl = own[np.isnan(y_al[own])]          # the target's own unlabelled rows
+                    # fit_clf=True is required: skactiveml refuses a pre-fitted model it
+                    # cannot attribute to known rows ("unknown where it has been fitted on"),
+                    # so it refits on (Xq, y_al) itself before simulating each candidate label
+                    idx = qs.query(X=Xq, y=y_al, clf=clf, fit_clf=True,
+                                   ignore_partial_fit=True,
+                                   X_eval=Xq[own_unl] if len(own_unl) else None,
+                                   batch_size=args.batch)
+                else:
+                    idx = qs.query(X=sp.Z, y=y_al, batch_size=args.batch)
                 y_al[idx] = sp.y[idx]
                 bought.extend(int(i) for i in idx)
                 for i in idx:
@@ -148,7 +195,8 @@ def main():
     ap.add_argument("--target", default=TARGET, help="load_data.TARGETS key, or label:NAME")
     ap.add_argument("--block", type=int, default=BLOCK_W, help="W: minutes per block (1 = none)")
     ap.add_argument("--methods", nargs="+", default=list(METHODS),
-                    choices=["typiclust", "coreset", "probcover", "random"])
+                    choices=["typiclust", "coreset", "probcover", "eer", "laplace", "laplace_var",
+                             "random"])
     ap.add_argument("--splits", type=int, default=1, help="independent day splits to average over")
     ap.add_argument("--first_split", type=int, default=0)
     ap.add_argument("--rounds", type=int, default=ROUNDS)
@@ -157,6 +205,8 @@ def main():
     ap.add_argument("--n_seed_pos", type=int, default=N_SEED_POS)
     ap.add_argument("--n_slopes", type=int, default=N_SLOPES)
     ap.add_argument("--typiclust_k", type=int, default=TYPICLUST_K)
+    ap.add_argument("--eer_candidates", type=int, default=50,
+                    help="candidates subsampled per round for --methods eer (2 refits each)")
     ap.add_argument("--fe_p", type=float, default=1.0, help="fixed-effect prior SD")
     ap.add_argument("--vcp_p", type=float, default=0.5, help="prior SD on log random-effect SD")
     ap.add_argument("--min_test_pos", type=int, default=1,
@@ -167,6 +217,9 @@ def main():
     ap.add_argument("--reserve", action="store_true",
                     help="never write into a folder that already holds results")
     ap.add_argument("--resume", action="store_true", help="skip splits already written")
+    ap.add_argument("--no_index", action="store_true",
+                    help="do not touch results/index.csv -- for parallel jobs, which would "
+                         "otherwise race on one file; run `python paths.py --reindex` after")
     ap.add_argument("--out", default=None, help="override the derived folder (rarely wanted)")
     args = ap.parse_args()
 
@@ -185,7 +238,13 @@ def main():
     have = done_splits(out) if args.resume else []
     if have:
         print(f"  resuming: splits {have} already written", flush=True)
-    ids = None
+    # Fixed uuid -> M1..Mn map, built from the dataset rather than from whichever split runs
+    # first. Threading `ids` through the loop (the old behaviour) gave stable numbering only
+    # because split `first_split` happened to run first and define it; a job that runs ONE split
+    # in its own process -- which is what the cluster fan-out does -- would renumber from its own
+    # keep list, and M21 would name a different person in different jobs. Verified to reproduce
+    # the numbering every existing run already uses, so no finished result changes.
+    ids = canonical_ids(data)
     for k in range(args.first_split, args.first_split + args.splits):
         if k in have:
             continue
@@ -196,7 +255,8 @@ def main():
         f_round, f_query = split_files(out, k)
         R.to_csv(f_round, index=False)
         Q.to_csv(f_query, index=False)
-        update_index(out, cfg)
+        if not args.no_index:
+            update_index(out, cfg)
 
         last = R[R["round"] == R["round"].max()]
         w = last.pivot_table(index="target", columns="method", values="auroc")
@@ -206,7 +266,8 @@ def main():
             print(f"  split {k}: {alt}-random {gap.mean():+.4f} "
                   f"(SE {gap.std(ddof=1) / np.sqrt(len(gap)):.4f}), "
                   f"{alt} better on {int((gap > 0).sum())}/{len(gap)}", flush=True)
-    update_index(out, cfg)
+    if not args.no_index:          # the per-split call above honours this; so must the final one
+        update_index(out, cfg)
     print(f"done -> {out}")
 
 
