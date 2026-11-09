@@ -104,6 +104,18 @@ def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
     loc, flagged = seed_set(sp.y[own], tr_day[tgt_uuid], rng, args.n_seed, args.n_seed_pos)
     seed_rows = own[loc]
 
+    # The acquisition's RNG, keyed on the TARGET as well as the split. It used to be
+    # `args.seed + split_id`, one integer shared by all 43 targets, which made RandomSampling
+    # replay the identical stream for every one of them: M1 and M2 bought the same 30 rows, so
+    # 43 "replicates" of the random arm were really one draw and its per-target error bars were
+    # meaningless. Its own generator rather than a draw from `rng` above, because `rng` has
+    # already been consumed by seed_set and would make the value depend on the method's
+    # position in args.methods -- then `--methods random` and `--methods laplace random` would
+    # disagree, breaking the promise cluster/run.py relies on when it submits them separately.
+    # 7 just separates this stream from the 11 used for the seed set.
+    strat_seed = int(np.random.default_rng(
+        [args.seed, split_id, int(pid[1:]), 7]).integers(2 ** 31))
+
     Xclf = attach_person(sp.Z, sp.owner, sp.users)                 # person code as last column
     Zte, yte = sp.test_of(tgt_uuid)
     Xte = attach_person(Zte, [tgt_uuid] * len(yte), sp.users)
@@ -117,7 +129,7 @@ def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
     LAPLACE_STRATEGIES = {"laplace", "laplace_var"}
     rows, queries = [], []
     for method in args.methods:
-        qs = build_strategy(method, args.seed + split_id, args.typiclust_k, args.eer_candidates)
+        qs = build_strategy(method, strat_seed, args.typiclust_k, args.eer_candidates)
         y_al = np.full(len(sp.y), np.nan)
         y_al[seed_rows] = sp.y[seed_rows]
         bought = []
