@@ -30,7 +30,7 @@ REPO = os.path.dirname(HERE)
 # False submits to SLURM. True runs the queue one entry after another in the current shell --
 # the local path, and the reason this file replaces typing `python main.py ...` by hand. To run
 # a single acquisition locally, set this True and comment out the QUEUE entries you do not want.
-DRYRUN = True
+DRYRUN = False
 
 # SLURM stdout/stderr only. Results go wherever paths.run_dir() puts them (results/<target>/...),
 # so this directory holds logs and nothing else.
@@ -41,7 +41,7 @@ LOG_DIR = os.path.join(REPO, "cluster", "logs")
 # AL_PYTHON=$(which python) after `micromamba activate`.
 PYTHON = os.environ.get("AL_PYTHON") or os.path.join(REPO, ".venv", "bin", "python")
 
-N_SPLITS = 2
+N_SPLITS = 20
 
 # Every acquisition run so far, each paired with `random` in the same job. The pairing is not
 # cosmetic: both methods share one seed set per target, so the gap is computed within a job and
@@ -60,14 +60,14 @@ N_SPLITS = 2
 # the METHOD flag is still `laplace`, because that string is written into the finished CSVs and
 # the run folder name and renaming it there would orphan them.
 QUEUE = [
-    ("smoke", dict(split=[0], methods=["random"],
-                rounds=[1], max_targets=[3], tag=["smoke"])),
-    # ("random",    dict(split=list(range(N_SPLITS)), methods=["random"])),
-    # ("eu",        dict(split=list(range(N_SPLITS)), methods=["laplace"])),
+    # ("smoke", dict(split=[0], methods=["random"],
+    #             rounds=[1], max_targets=[3], tag=["smoke"])),
+    ("random",    dict(split=list(range(N_SPLITS)), methods=["random"])),
+    ("eu",        dict(split=list(range(N_SPLITS)), methods=["laplace"])),
     # ("eer",       dict(split=list(range(N_SPLITS)), methods=["eer"])),
-    # ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
-    # ("coreset",   dict(split=list(range(N_SPLITS)), methods=["coreset"])),
-    # ("probcover", dict(split=list(range(N_SPLITS)), methods=["probcover"])),
+    ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
+    ("coreset",   dict(split=list(range(N_SPLITS)), methods=["coreset"])),
+    ("probcover", dict(split=list(range(N_SPLITS)), methods=["probcover"])),
 ]
 
 # Random is its own entry rather than riding along in every job. That is safe because the seed
@@ -87,7 +87,7 @@ QUEUE = [
 # Settings shared by every job. These must match across the queue entries you intend to compare,
 # because the grid overlays curves from different runs on the assumption that split k means the
 # same split everywhere -- which holds only if block/n_seed/seed/rounds/batch agree.
-COMMON = dict(target="computer_work", block=15, rounds=10, batch=3,
+COMMON = dict(target="computer_work", block=15, rounds=100, batch=3,
               n_seed=3, n_seed_pos=1, n_slopes=5, seed=0)
 
 

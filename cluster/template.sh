@@ -2,7 +2,7 @@
 #SBATCH -J EXPNAME
 #SBATCH -n 1                     # one core: the work is a single-threaded statsmodels fit loop
 #SBATCH -N 1
-#SBATCH -t 0-04:00               # EER is the slow one at ~1.2 h/split; 4 h leaves headroom
+#SBATCH -t 0-12:00               # 100 rounds: refits slow as the labelled set grows
 #SBATCH -p shared                # NOT `test` -- that partition caps at ~1 h and is for debugging
 #SBATCH --mem=16000              # 748 MB of CSV read per job, then ~11k x 124 float64 in memory
 #SBATCH -o EXPDIR/out_%j.txt
