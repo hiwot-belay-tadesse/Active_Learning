@@ -34,6 +34,7 @@ Figures are written inside the run's own ``figures/`` directory, so deleting a r
 everything derived from it.
 """
 import argparse
+import glob
 import os
 import sys
 
@@ -53,6 +54,39 @@ COL = {"typiclust": "purple", "coreset": "seagreen", "random": "darkorange",
 # folder name -- renaming it there would orphan every finished run -- so the relabelling is
 # cosmetic and lives only here. `--order_by` and `--methods` still take the real name.
 LABEL = {"laplace": "EU", "laplace_var": "EU (own variance)"}
+
+
+def load_refs(runs):
+    """-> (frame, where) for the first run that has reference models, else (None, None).
+
+    Searches the primary run and then every `--also` run, because `main.py --refs` is enabled
+    on ONE queue entry (the references depend on the split and the priors, not on the
+    acquisition), so they usually live in a sibling folder rather than the one being plotted.
+
+    A run whose splits were computed by the cluster array holds one
+    ``reference_auroc_split<k>.csv`` per job and no combined file. Those are concatenated here
+    and the result cached as ``reference_auroc.csv``, which is all
+    ``reference_models.py --merge`` does -- no model is fitted, so doing it inline costs
+    nothing and removes a manual step between the array draining and a figure.
+    """
+    import pandas as pd
+    for run in runs:
+        whole = os.path.join(run, "analysis", "reference_auroc.csv")
+        if os.path.exists(whole):
+            return pd.read_csv(whole), whole
+        parts = sorted(glob.glob(os.path.join(run, "analysis",
+                                              "reference_auroc_split*.csv")))
+        if parts:
+            R = pd.concat([pd.read_csv(f) for f in parts], ignore_index=True) \
+                  .drop_duplicates(["split", "target", "model"], keep="last")
+            try:
+                R.to_csv(whole, index=False)
+            except OSError:                       # read-only tree: use it, just do not cache
+                pass
+            print(f"merged {len(parts)} per-split reference file(s) from "
+                  f"{os.path.basename(run)}")
+            return R, whole
+    return None, None
 
 
 def split_half_rho(G, n=200, seed=0):
@@ -83,11 +117,18 @@ def main():
     ap.add_argument("--target", default="computer_work", help="used when --run is omitted")
     ap.add_argument("--contains", default=None, help="narrow the run lookup by folder substring")
     ap.add_argument("--also", nargs="*", default=None,
-                    help="other run folders whose methods to overlay. Only legitimate when the "
-                         "runs share target, block, slopes, priors, seed set and splits -- the "
-                         "seed sets are keyed on (seed, split, participant), so curves from "
-                         "such runs are paired, not independent. Checked below; methods already "
-                         "present are skipped, so `random` is taken from the primary run.")
+                    help="other run folders whose methods to overlay. Omit it and every "
+                         "SIBLING of the primary run -- the other folders beside it that "
+                         "agree on target, block, slopes, priors, seeds, rounds and batch -- "
+                         "is picked up automatically, which is what the cluster fan-out "
+                         "produces (one folder per method). Naming folders explicitly turns "
+                         "that off and a mismatch is then an error rather than a skip. "
+                         "Overlaying is only legitimate for runs that agree on those keys: "
+                         "the seed sets are keyed on (seed, split, participant), so such "
+                         "curves are paired, not independent. Methods already in the primary "
+                         "run are skipped, so `random` is taken from there if present.")
+    ap.add_argument("--no_siblings", action="store_true",
+                    help="plot the primary run alone; do not look for sibling folders")
     ap.add_argument("--rows", type=int, default=4, help="panel rows; columns follow")
     ap.add_argument("--order_by", default=None,
                     help="method whose gap over random orders the panels (default: the first "
@@ -111,16 +152,43 @@ def main():
     # splits present, which is checked below against the CSVs on disk rather than the config.
     SAME = ["target", "block", "n_slopes", "fe_p", "vcp_p", "n_seed", "n_seed_pos",
             "rounds", "batch"]
-    merged = []
-    for other in (a.also or []):
+    explicit = a.also is not None
+    if explicit:
+        others = list(a.also)
+    elif a.no_siblings:
+        others = []
+    else:
+        # Everything beside the primary run. The cluster fan-out writes one folder per method
+        # (run_dir derives the name from the method list), so the siblings ARE the other
+        # acquisitions -- there is nothing for the caller to type that this cannot work out.
+        others = [d for d in sorted(glob.glob(os.path.join(os.path.dirname(run), "*")))
+                  if os.path.isdir(d) and os.path.abspath(d) != os.path.abspath(run)
+                  and os.path.exists(os.path.join(d, "config.json"))]
+    merged, used = [], []
+    for other in others:
         ocfg = read_config(other)
         bad = [k for k in SAME if cfg.get(k) != ocfg.get(k)]
         if bad:
-            raise SystemExit(f"{os.path.basename(other)} differs on {bad}; curves would not be "
-                             f"comparable")
+            # A folder the caller named is a mistake worth stopping for; one we found
+            # ourselves is just a different experiment sitting in the same directory.
+            if explicit:
+                raise SystemExit(f"{os.path.basename(other)} differs on {bad}; curves would "
+                                 f"not be comparable")
+            continue
         E = load_run(other, "per_round")
         shared = sorted(set(D.split) & set(E.split))
         if set(D.split) != set(E.split):
+            # Every arm has to be averaged over the SAME splits or the gap is not paired, so a
+            # short sibling can only be included by shortening everything else to match. That
+            # is a real cost -- one method whose jobs half-failed would quietly decide how many
+            # splits the whole figure rests on -- so it is done only when the caller named the
+            # folder. A sibling we found ourselves is dropped instead, loudly.
+            if not explicit:
+                print(f"  skipped {os.path.basename(other)}: has splits "
+                      f"{sorted(set(E.split))}, the run has {sorted(set(D.split))}; "
+                      f"name it with --also to include it and shorten every arm to the "
+                      f"{len(shared)} shared")
+                continue
             print(f"  note: {os.path.basename(other)} has splits {sorted(set(E.split))} vs "
                   f"{sorted(set(D.split))} here; restricting both to the {len(shared)} shared")
             if not shared:
@@ -132,8 +200,10 @@ def main():
             import pandas as pd
             D = pd.concat([D, E], ignore_index=True)
             merged += sorted(set(E.method))
+            used.append(other)
     if merged:
-        print(f"overlaid {', '.join(merged)} from {len(a.also)} other run(s)")
+        print(f"overlaid {', '.join(merged)} from {len(used)} other run(s): "
+              + ", ".join(os.path.basename(u) for u in used))
     methods = [m for m in D.method.unique()]
     alt = a.order_by or next((m for m in methods if m != "random"), None)
     if alt is None or "random" not in methods:
@@ -154,13 +224,21 @@ def main():
               "global_sklearn": "gold"}
     if a.show_unpenalised:
         REFCOL["global_full"] = "olive"
-    rpath = a.refs or os.path.join(run, "analysis", "reference_auroc.csv")
-    if not a.no_refs and os.path.exists(rpath):
-        import pandas as pd
-        REF = (pd.read_csv(rpath).pivot_table(index="target", columns="model", values="auroc"))
-        if "global_prior" not in REF and "global_full" in REF:     # older runs
-            REFCOL["global_full"] = REFCOL.pop("global_prior", "slategrey")
-        print(f"references: {', '.join(REF.columns)} from {os.path.relpath(rpath, run)}")
+    if not a.no_refs:
+        if a.refs:                                # an explicit file still wins
+            import pandas as pd
+            RAW, rpath = pd.read_csv(a.refs), a.refs
+        else:
+            RAW, rpath = load_refs([run] + others)
+        if RAW is None:
+            print("references: none found -- run the AL jobs with --refs, or pass --refs "
+                  "<reference_auroc.csv>; drawing curves only")
+        else:
+            REF = RAW.pivot_table(index="target", columns="model", values="auroc")
+            if "global_prior" not in REF and "global_full" in REF:     # older runs
+                REFCOL["global_full"] = REFCOL.pop("global_prior", "slategrey")
+            print(f"references: {', '.join(REF.columns)} over "
+                  f"{RAW.split.nunique()} split(s) from {rpath}")
 
     order = list(gap.index) + ["MEAN"]
     nrow = a.rows
