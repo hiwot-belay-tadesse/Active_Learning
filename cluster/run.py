@@ -75,7 +75,7 @@ QUEUE = [
     # Caveat for reading the result: the variance branch takes a static top-b of one ranking
     # (laplace_variance.py:296), with no Sherman-Morrison between picks, so a batch of 3 can be
     # three adjacent blocks of the same participant. EU does not have that failure mode.
-    ("laplace_var", dict(split=list(range(N_SPLITS)), methods=["laplace_var"])),
+    # ("laplace_var", dict(split=list(range(N_SPLITS)), methods=["laplace_var"])),
     # ("eer",       dict(split=list(range(N_SPLITS)), methods=["eer"])),
     ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
     ("coreset",   dict(split=list(range(N_SPLITS)), methods=["coreset"])),
@@ -99,7 +99,14 @@ QUEUE = [
 # Settings shared by every job. These must match across the queue entries you intend to compare,
 # because the grid overlays curves from different runs on the assumption that split k means the
 # same split everywhere -- which holds only if block/n_seed/seed/rounds/batch agree.
+# seed_source="cohort" puts n_seed_per_person labels from EVERY participant in the starting
+# set (2 x 43 = 86 here, of which 2 are the target's own), so every arm begins from the same
+# population model instead of from the target's own n_seed labels. n_seed/n_seed_pos are then
+# unused -- initial_labels() reads them only under seed_source="self" -- but are left in place
+# so switching back needs no edit. The seeding is part of the run folder name, so cohort and
+# self runs cannot overwrite each other.
 COMMON = dict(target="computer_work", block=15, rounds=10, batch=3,
+              seed_source="cohort", n_seed_per_person=2,
               n_seed=3, n_seed_pos=1, n_slopes=5, seed=0)
 
 
