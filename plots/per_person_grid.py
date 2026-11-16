@@ -63,6 +63,7 @@ LABEL = {"laplace": "EU", "laplace_var": "EU (own variance)",
 # Short names for the reference models, used in the panel titles where the full name would
 # not fit beside its value.
 SHORT = {"mixed_full": "mixed", "global_prior": "prior", "global_sklearn": "global",
+         "personal_full": "personal",
          "global_full": "unpen"}
 
 
@@ -156,6 +157,12 @@ def main():
     ap.add_argument("--ref_models", nargs="*", default=None,
                     help="draw only these reference models, e.g. `--ref_models "
                          "global_sklearn`. Default: all of them that the CSV holds.")
+    ap.add_argument("--keep_tails", action="store_true",
+                    help="draw a target whose own pool runs out to the last round ANY of its "
+                         "splits reached, instead of cutting every split back to the first "
+                         "round one of them ran dry. The tail then averages fewer splits than "
+                         "the head -- the count is printed per round -- so the band narrows "
+                         "for a reason that has nothing to do with the acquisition.")
     ap.add_argument("--no_chance", action="store_true",
                     help="drop the dotted prevalence line that AUPRC otherwise carries")
     ap.add_argument("--order", default="gap", choices=["gap", "personalisation", "id"],
@@ -292,12 +299,42 @@ def main():
     alt = a.order_by or next((m for m in methods if m != "random"), None)
     if alt is None or "random" not in methods:
         raise SystemExit(f"need an acquisition and random in the run; found {methods}")
+    # A participant can exhaust their OWN pool before the budget is spent -- personal runs buy
+    # min(batch, remaining) and then stop -- and they hit that wall at a different round in
+    # each split. Leaving the tail in place would quietly change how many splits stand behind
+    # a point partway along that target's curve (20 up to round 8, then 18), so every split of
+    # such a target is cut back to the earliest round any split of theirs stopped at. Nothing
+    # happens to a target whose splits all ran the full budget, which is every target of a
+    # pooled run.
+    cut = D.groupby(["target", "split"])["round"].max().groupby("target").min()
     R = D["round"].max()
+    short = cut[cut < R]
+    if len(short) and not a.keep_tails:
+        print("  pool exhausted -- every split cut to the first round it ran out: "
+              + ", ".join(f"{t} at round {int(r)}" for t, r in short.items()))
+        D = D[D["round"] <= D.target.map(cut)]
+    elif len(short):
+        # --keep_tails: the curve runs as far as any split got, and the tail rests on fewer
+        # splits than the head. Printed per target, because an SE band that narrows or widens
+        # for that reason looks like a property of the acquisition and is not one.
+        for t, r in short.items():
+            n = (D[(D.target == t) & (D.method == "random")]
+                 .groupby("round").split.nunique())
+            tail = n[n < n.iloc[0]]
+            print(f"  {t}: pool runs out from round {int(r) + 1}; splits behind each round "
+                  f"{dict(zip(tail.index.tolist(), tail.values.tolist()))} of {int(n.iloc[0])}")
     nsplit = D.split.nunique()
+    if len(short):
+        n_per_round = D[D.method == "random"].groupby("round").target.nunique()
+        thin = n_per_round[n_per_round < D.target.nunique()]
+        if len(thin):
+            print(f"  MEAN panel: rounds {list(thin.index)} average "
+                  f"{sorted(set(thin.values))} targets, not {D.target.nunique()}")
 
-    # gap per (target, split) at the last round -> ordering, and the stability check
-    W = (D[D["round"] == R].pivot_table(index=["target", "split"], columns="method",
-                                        values=a.metric))
+    # gap per (target, split) at that target's last round -> ordering, and the stability check
+    last = D.groupby("target")["round"].transform("max")
+    W = (D[D["round"] == last].pivot_table(index=["target", "split"], columns="method",
+                                           values=a.metric))
     gapts = (W[alt] - W["random"]).rename("gap").reset_index()
     G = gapts.pivot(index="target", columns="split", values="gap")
     gap = G.mean(axis=1).sort_values(ascending=False)
@@ -307,7 +344,16 @@ def main():
     # saddlebrown is deliberate: it collides with no acquisition colour in COL above, nor
     # with crimson/slategrey here or the mediumblue chance line.
     REFCOL = {"mixed_full": "crimson", "global_prior": "slategrey",
-              "global_sklearn": "saddlebrown"}
+              "global_sklearn": "darkgreen",
+              # the target's own rows, 100% of their labels -- the ceiling for a personal run,
+              # where mixed_full is a bound a target-only model cannot reach
+              "personal_full": "saddlebrown"}
+    # Distinct dash patterns as well as colours: on a personal grid personal_full and
+    # mixed_full sit close together on several participants, and two dashed lines of similar
+    # length are hard to tell apart at this panel size even in different colours.
+    REFLS = {"personal_full": "--", "mixed_full": (0, (6, 2, 1, 2)),
+             "global_prior": (0, (4, 3)), "global_sklearn": (0, (1, 2)),
+             "global_full": (0, (3, 1, 1, 1))}
     if a.show_unpenalised:
         REFCOL["global_full"] = "olive"
     if a.ref_models is not None:
@@ -367,7 +413,7 @@ def main():
     # Chance for AUPRC is the positive rate of the test set, not 0.5, and it differs per
     # target and per split. Only the reference CSV carries n_test -- per_round_split*.csv
     # records n_pos_test alone -- so the line is available exactly when references are.
-    PREV = PLO = PHI = None
+    PREV = PLO = PHI = PSD = None
     if a.metric == "auprc" and not a.no_chance:
         if REF is not None and {"n_pos_test", "n_test"} <= set(RAW.columns):
             pv = RAW.drop_duplicates(["split", "target"])
@@ -377,10 +423,19 @@ def main():
             # small day dominate: M33 reads 0.108 averaged but 0.055 pooled. The curve drawn
             # above is effectively a size-weighted average too, so pooled is the honest match.
             PREV = gp.n_pos_test.sum() / gp.n_test.sum()
-            # The floor itself moves between splits -- median range 0.13, up to 0.39 -- so a
-            # single line claims a precision the data does not have. The band is that range.
+            # The floor itself moves between splits, so a single line claims a precision the
+            # data does not have. The band is +/- 1 SE across splits around the pooled value --
+            # the same convention as every other "+/-" on the figure. (It was the min-max range
+            # before, which is wider by roughly sqrt(n_splits) and is set by two extreme
+            # splits rather than by the spread.)
             r = (pv.n_pos_test / pv.n_test).groupby(pv.target)
-            PLO, PHI = r.min(), r.max()
+            _pse = r.std(ddof=1) / np.sqrt(r.count())
+            PLO, PHI = PREV - _pse, PREV + _pse
+            # SE across splits, printed beside pi in the title -- the same convention as the
+            # reference values above each panel and the bands around the curves, so every "+/-"
+            # on the figure means one thing. How far the floor actually MOVES between splits is
+            # the shaded min-max band, which is wider by about sqrt(n_splits).
+            PSD = _pse
         else:
             print("chance line: needs n_test from the reference CSV; drawing none")
 
@@ -416,12 +471,23 @@ def main():
         d = D if tgt == "MEAN" else D[D.target == tgt]
         for m in methods:
             g = d[d.method == m]
-            # average within a split first, so the SE is across splits in the MEAN panel too
-            per = g.pivot_table(index="split", columns="acquired", values=a.metric)
+            # Average within a split first, so the SE is across splits in the MEAN panel too.
+            #
+            # Grouped by ROUND, not by `acquired`. They agree whenever every round buys a full
+            # batch, but a participant whose own pool runs out buys a partial one -- the
+            # personal runs do this -- and then that target alone has, say, acquired=23. In a
+            # pivot over `acquired` that column holds ONE target, so the MEAN panel plotted
+            # that single participant's value as if it were the mean of 43, which showed up as
+            # spikes reaching M22's level. Rounds are shared by every target by construction.
+            per = g.pivot_table(index="split", columns="round", values=a.metric)
             mu = per.mean()
             se = per.std(ddof=1) / np.sqrt(per.notna().sum())
-            ax.plot(mu.index, mu.values, color=COL.get(m, "grey"), lw=1.4, label=LABEL.get(m, m))
-            ax.fill_between(mu.index, mu - se, mu + se, color=COL.get(m, "grey"),
+            # x stays "labels acquired": the mean over the rows behind each round, which is
+            # exactly round*batch except where a partial batch happened.
+            xs = g.groupby("round").acquired.mean().reindex(mu.index)
+            ax.plot(xs.values, mu.values, color=COL.get(m, "grey"), lw=1.4,
+                    label=LABEL.get(m, m))
+            ax.fill_between(xs.values, mu - se, mu + se, color=COL.get(m, "grey"),
                             alpha=0.18, lw=0)
         reftxt = []
         if REF is not None:
@@ -433,7 +499,7 @@ def main():
                 else:
                     v, se = REF[model].get(tgt, np.nan), REFSE[model].get(tgt, np.nan)
                 if np.isfinite(v):
-                    ax.axhline(v, color=colour, lw=1.1, ls="--",
+                    ax.axhline(v, color=colour, lw=1.1, ls=REFLS.get(model, "--"),
                                label=(f"{model} (100% labels)" if tgt == order[0] else None))
                     # The SE goes in the title rather than a band: at this panel size the
                     # bands overlapped the curves they were meant to be compared against.
@@ -453,14 +519,19 @@ def main():
                             else (PLO.get(tgt, np.nan), PHI.get(tgt, np.nan)))
                 if np.isfinite(lo_) and np.isfinite(hi_) and hi_ > lo_:
                     ax.axhspan(lo_, hi_, color="mediumblue", alpha=0.12, lw=0,
-                               label=(r"$\pi$ range over splits" if tgt == order[0]
+                               label=(r"$\pi$ $\pm$1 SE over splits" if tgt == order[0]
                                       else None))
+        # sd of pi across splits, for the title
+        sd = np.nan
+        if PSD is not None and np.isfinite(pi):
+            sd = PSD.mean() if tgt == "MEAN" else PSD.get(tgt, np.nan)
+        sdt = f"$\\pm${sd:.3f}" if np.isfinite(sd) else ""
         if tgt == "MEAN":
-            pit = "" if not np.isfinite(pi) else f"  $\\pi$={pi:.3f}"
+            pit = "" if not np.isfinite(pi) else f"  $\\pi$={pi:.3f}{sdt}"
             ax.set_title(f"MEAN (n={D.target.nunique()}){pit}", fontsize=8,
                          fontweight="bold", pad=14 if reftxt else None)
         else:
-            pit = "" if not np.isfinite(pi) else f"  ($\\pi$={pi:.3f})"
+            pit = "" if not np.isfinite(pi) else f"  ($\\pi$={pi:.3f}{sdt})"
             # The signed gap is not printed: the panels are already ORDERED by it, best
             # first, so the position in the grid carries the same information.
             ax.set_title(f"{tgt}{pit}", fontsize=8, pad=14 if reftxt else None)
