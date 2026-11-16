@@ -92,6 +92,56 @@ def main():
                          "lives inside the paired run folders when a corrected standalone "
                          "random run exists. Without this the two copies both survive the "
                          "dedup (their rows genuinely differ) and are silently pooled.")
+    ap.add_argument("--scale", default="shared", choices=["shared", "per_panel"],
+                    help="shared (default) puts every panel on ONE colour scale, so a colour "
+                         "means the same number everywhere and the panels can be compared -- "
+                         "which is the point of showing them side by side. per_panel gives "
+                         "each its own scale: prettier, but a mid-blue then means -0.05 in "
+                         "one panel and -0.015 in the next.")
+    ap.add_argument("--mask_diag", action="store_true",
+                    help="blank the diagonal (the target's own rows). On a shared scale the "
+                         "diagonal sets the range -- EU's is +0.92 against off-diagonal "
+                         "values under 0.05 -- so everything else renders white. Masking it "
+                         "hands the whole range to the off-diagonal, which is where the "
+                         "'whose labels does it buy' question actually lives. The diagonal "
+                         "is in every panel title anyway.")
+    ap.add_argument("--split", type=int, default=None, metavar="k",
+                    help="use ONE split instead of pooling all of them, and measure against "
+                         "that split's own pool share. The denominator per target drops to "
+                         "rounds x batch (30 here), so a source's share moves in steps of "
+                         "1/30 = 0.033 -- larger than every pool share, which means a cell is "
+                         "essentially picked-or-not rather than a graded deviation. Useful to "
+                         "see one replicate as it actually ran; not for reading structure.")
+    ap.add_argument("--show_mean", action="store_true",
+                    help="append a one-column strip on the right of each panel holding each "
+                         "source's ROW MEAN -- its deviation averaged over all targets, the "
+                         "same number the aggregated bar chart shows. For the geometry "
+                         "methods that strip reproduces almost the whole panel (94-99.9%% of "
+                         "its variance); for EU it does not (47%%), which is the point of "
+                         "showing both side by side. Drawn on the panel's own colour scale, "
+                         "separated by a gap so it is not read as another target.")
+    ap.add_argument("--min_z", type=float, default=0.0,
+                    help="blank every (source, target) cell whose deviation is not this many "
+                         "standard errors from zero, the SE taken ACROSS SPLITS. The splits "
+                         "are independent replicates of the whole experiment, so this asks "
+                         "'would this pair come out over-queried again if the days were "
+                         "partitioned differently?' and leaves only the cells that survive. "
+                         "2 is the usual choice. Costs a second pass: the matrix is rebuilt "
+                         "inside each split.")
+    ap.add_argument("--methods", nargs="+", default=None,
+                    help="draw only these acquisitions, in the usual panel order. The default "
+                         "is every method found in the queries CSVs -- which is what makes the "
+                         "figure a comparison, so narrowing it is for looking closely at one "
+                         "arm, not for the figure of record.")
+    ap.add_argument("--sign", default="query_minus_pool",
+                    choices=["query_minus_pool", "pool_minus_query"],
+                    help="which way round the deviation is drawn. The default `query share - "
+                         "pool share` is positive for an OVER-queried source. "
+                         "`pool_minus_query` negates every cell, so positive (red) is a source "
+                         "the acquisition bought LESS from than its size in the pool -- the "
+                         "same information, read as under-use. The row ORDER does not change, "
+                         "so the two figures are cell-for-cell comparable; with this sign the "
+                         "leading rows are therefore the most negative ones.")
     ap.add_argument("--out", default="query_share_heatmaps.png")
     ap.add_argument("--boot", type=int, default=1000,
                     help="bootstrap resamples over TARGETS for the per-method error bars")
@@ -105,7 +155,18 @@ def main():
     # random is written into several run folders from the same seed; one copy per query
     Q = Q.drop_duplicates(["method", "split", "target", "round", "row"])
     Q = _drop(Q, a.drop)
+    if a.split is not None:
+        if a.split not in set(Q.split):
+            raise SystemExit(f"split {a.split} not in this run; have "
+                             f"{sorted(Q.split.unique())}")
+        Q = Q[Q.split == a.split]
     splits = sorted(Q.split.unique())
+    if a.methods is not None:
+        unknown = set(a.methods) - set(Q.method)
+        if unknown:
+            raise SystemExit(f"unknown method(s) {sorted(unknown)}; this run has "
+                             f"{sorted(set(Q.method))}")
+        Q = Q[Q.method.isin(a.methods)]
     ms = [m for m in ORDER if m in set(Q.method)] + \
          [m for m in sorted(set(Q.method)) if m not in ORDER]
     print(f"{len(files)} file(s), {len(Q)} queries, methods {ms}, splits {splits}")
@@ -133,6 +194,35 @@ def main():
              .reindex(index=pids, columns=targets).fillna(0.0))
         counts[m] = c
         mats[m] = c.div(c.sum(axis=0), axis=1).sub(P, axis=0)
+    # The sign flip is applied once, here, to the finished matrices: everything downstream
+    # (colour scale, masking, the diagonal in the panel title, the mean strip) then follows
+    # without a second code path. SE is a standard deviation and is sign-free.
+    FLIP = a.sign == "pool_minus_query"
+    if FLIP:
+        mats = {m: -v for m, v in mats.items()}
+    DLAB = "pool share $-$ query share" if FLIP else "query share $-$ pool share"
+
+    # Per-split matrices, for the across-split SE. Built only when --min_z asks for it,
+    # because it is 20x the pivoting work and most calls do not need it.
+    SE = {}
+    if a.min_z > 0:
+        for m in ms:
+            per = []
+            for k in splits:
+                qk = Q[(Q.method == m) & (Q.split == k)]
+                ck = (qk.pivot_table(index="owner", columns="target", values="row",
+                                     aggfunc="size")
+                      .reindex(index=pids, columns=targets).fillna(0.0))
+                tot = ck.sum(axis=0).replace(0.0, np.nan)
+                per.append(ck.div(tot, axis=1).sub(P, axis=0))
+            A3 = np.dstack([x.values for x in per])
+            SE[m] = pd.DataFrame(np.nanstd(A3, axis=2, ddof=1) / np.sqrt(A3.shape[2]),
+                                 index=pids, columns=targets)
+        kept = {m: float(np.mean(np.abs(mats[m].values) >= a.min_z * SE[m].values))
+                for m in ms}
+        print("cells surviving |mean| >= "
+              f"{a.min_z:g} SE across splits: "
+              + ", ".join(f"{m} {100 * v:.1f}%" for m, v in kept.items()))
 
     def row_order(m):
         """-> (sources, targets) for one panel. Same order on both axes keeps the diagonal."""
@@ -161,7 +251,7 @@ def main():
     for m in ms:
         s = counts[m].sum(axis=1)
         tbl[f"{m}_share"] = s / s.sum()
-        tbl[f"{m}_delta"] = tbl[f"{m}_share"] - P
+        tbl[f"{m}_delta"] = (P - tbl[f"{m}_share"]) if FLIP else (tbl[f"{m}_share"] - P)
     csv = analysis_path(run, "query_share_by_method.csv")
     pd.DataFrame(tbl).to_csv(csv)
     print(f"saved {csv}")
@@ -181,27 +271,69 @@ def main():
     ncol = min(a.cols, len(ms))
     nrow = int(np.ceil(len(ms) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.6 * ncol, 5.9 * nrow), squeeze=False)
-    for ax, m in zip(axes.ravel(), ms):
+
+    def panel_values(m):
         src, tgts = row_order(m)
-        V = mats[m].loc[src, tgts].values
-        lo, hi = float(np.nanmin(V)), float(np.nanmax(V))
+        V = mats[m].loc[src, tgts].copy()
+        if a.min_z > 0:
+            V = V.where(V.abs() >= a.min_z * SE[m].loc[src, tgts])
+        if a.mask_diag:
+            for t in V.columns:
+                if t in V.index:
+                    V.loc[t, t] = np.nan
+        return src, tgts, V.values
+
+    # On a shared scale the limits come from EVERY panel at once, so one colour is one number
+    # throughout the figure. Methods whose deviations are genuinely tiny then look washed out
+    # -- that is the comparison, not a defect of the drawing.
+    GLO = GHI = None
+    if a.scale == "shared":
+        allv = np.concatenate([panel_values(m)[2].ravel() for m in ms])
+        GLO, GHI = float(np.nanmin(allv)), float(np.nanmax(allv))
+        print(f"shared colour scale: [{GLO:+.4f}, {GHI:+.4f}]"
+              + ("  (diagonal masked)" if a.mask_diag else ""))
+    for ax, m in zip(axes.ravel(), ms):
+        src, tgts, V = panel_values(m)
+        lo, hi = ((GLO, GHI) if GLO is not None
+                  else (float(np.nanmin(V)), float(np.nanmax(V))))
         if lo < 0 < hi:
             kw = dict(norm=TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi))
         else:
             lim = max(abs(lo), abs(hi)) or 1e-9
             kw = dict(vmin=-lim, vmax=lim)
-        im = ax.imshow(V, cmap="RdBu_r", aspect="auto", **kw)
-        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
-        cb.ax.tick_params(labelsize=6)
-        cb.set_label("query share $-$ pool share", fontsize=7)
+        cmap = plt.get_cmap("RdBu_r").copy()
+        cmap.set_bad("0.85")                       # masked diagonal reads as grey, not white
+        im = ax.imshow(V, cmap=cmap, aspect="auto", **kw)
+        # On a shared scale every panel's bar would carry the SAME ticks, so one bar is drawn
+        # for the whole figure after the loop. Per-panel scales still need one bar each --
+        # that is the entire point of them.
+        if a.scale != "shared":
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+            cb.ax.tick_params(labelsize=6)
+            cb.set_label(DLAB, fontsize=7)
+        if a.show_mean:
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            axm = make_axes_locatable(ax).append_axes("right", size="4%", pad=0.14)
+            axm.imshow(np.nanmean(V, axis=1)[:, None], cmap=cmap, aspect="auto", **kw)
+            axm.set_yticks([])
+            axm.set_xticks([0])
+            axm.set_xticklabels(["mean"], rotation=90, fontsize=6)
+            for sp_ in axm.spines.values():
+                sp_.set_linewidth(1.2)
         ax.set_xticks(range(len(tgts)))
         ax.set_xticklabels(tgts, rotation=90, fontsize=5)
         ax.set_yticks(range(len(src)))
         ax.set_yticklabels(src, fontsize=5)
         d = np.array([mats[m].loc[t, t] for t in targets if t in pids], float)
-        lo, hi = boot_ci(d, a.boot)
-        ax.set_title(f"{LABEL.get(m, m)}\ndiagonal {d.mean():+.3f}  95% CI "
-                     f"[{lo:+.3f}, {hi:+.3f}]", fontsize=10, fontweight="bold")
+        # --boot 0 drops the interval everywhere. Its unit is the TARGET, so it is still
+        # computable from a single split -- but then it describes participant sampling only
+        # and says nothing about the split, which invites misreading.
+        if a.boot > 0:
+            lo, hi = boot_ci(d, a.boot)
+            ttl = f"diagonal {d.mean():+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]"
+        else:
+            ttl = f"diagonal {d.mean():+.3f}"
+        ax.set_title(f"{LABEL.get(m, m)}\n{ttl}", fontsize=10, fontweight="bold")
         ax.set_xlabel("target", fontsize=9)
         ax.set_ylabel("source (queries came from)", fontsize=9)
         for j, t in enumerate(tgts):                        # the target's own rows
@@ -210,12 +342,27 @@ def main():
                                            edgecolor="black", lw=0.6))
     for ax in axes.ravel()[len(ms):]:
         ax.axis("off")
-    fig.suptitle(f"{a.target}: per-participant query share minus pool share, "
-                 f"by acquisition function ({len(splits)} split(s)) -- rows sorted by "
-                 f"{a.sort}, most over-queried first; each panel has its own two-sloped "
-                 f"colour scale", fontsize=13)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out = figure_path(run, a.out)
+    if a.scale == "shared":
+        cb = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
+        cb.ax.tick_params(labelsize=8)
+        cb.set_label(DLAB, fontsize=9)
+    what = "pool share minus query share" if FLIP else "query share minus pool share"
+    first = " (so most NEGATIVE first, on this sign)" if FLIP else ""
+    # bbox_inches="tight" sizes the saved PNG to its widest artist, so an unwrapped one-line
+    # suptitle stretches a single-panel figure to several times the panel's own width. Wrap it
+    # to roughly the figure's width instead.
+    import textwrap
+    sub = (f"{a.target}: per-participant {what}, by acquisition function "
+           f"({len(splits)} split(s)) -- rows sorted by {a.sort}, most over-queried "
+           f"first{first}; each panel has its own two-sloped colour scale")
+    fig.suptitle(textwrap.fill(sub, width=max(60, 22 * ncol)), fontsize=13)
+    # A figure-level colour bar steals space from every axes at once, which tight_layout
+    # cannot account for -- calling it then warns and shifts the panels. Only lay out when
+    # each panel owns its bar.
+    if a.scale != "shared":
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out = figure_path(run, a.out if a.split is None
+                      else a.out.replace(".png", f"_split{a.split}.png"))
     fig.savefig(out, dpi=150, facecolor="white", bbox_inches="tight")
     print(f"saved {out}")
 
@@ -228,43 +375,30 @@ def main():
     diag = {m: np.array([mats[m].loc[t, t] for t in targets if t in pids], float) for m in ms}
     offd = {m: np.array([mats[m].loc[[s2 for s2 in pids if s2 != t], t].abs().mean()
                          for t in targets if t in pids], float) for m in ms}
-    print(f"\ndiagonal (target's own rows), bootstrap over {len(targets)} targets, "
-          f"{a.boot} resamples:")
+    print(f"\ndiagonal (target's own rows)" + (
+        f", bootstrap over {len(targets)} targets, {a.boot} resamples:" if a.boot > 0
+        else " -- no bootstrap (--boot 0):"))
     rows = []
     for m in ms:
-        dlo, dhi = boot_ci(diag[m], a.boot)
-        olo, ohi = boot_ci(offd[m], a.boot)
-        rows.append(dict(method=m, diag=diag[m].mean(), diag_lo=dlo, diag_hi=dhi,
-                         offdiag_absmean=offd[m].mean(), off_lo=olo, off_hi=ohi))
-        print(f"  {m:10s} {diag[m].mean():+.4f}  [{dlo:+.4f}, {dhi:+.4f}]   "
-              f"off-diag |mean| {offd[m].mean():.4f}  [{olo:.4f}, {ohi:.4f}]")
+        r = dict(method=m, diag=diag[m].mean(), offdiag_absmean=offd[m].mean())
+        if a.boot > 0:
+            dlo, dhi = boot_ci(diag[m], a.boot)
+            olo, ohi = boot_ci(offd[m], a.boot)
+            r.update(diag_lo=dlo, diag_hi=dhi, off_lo=olo, off_hi=ohi)
+            print(f"  {m:10s} {diag[m].mean():+.4f}  [{dlo:+.4f}, {dhi:+.4f}]   "
+                  f"off-diag |mean| {offd[m].mean():.4f}  [{olo:.4f}, {ohi:.4f}]")
+        else:
+            print(f"  {m:10s} {diag[m].mean():+.4f}   "
+                  f"off-diag |mean| {offd[m].mean():.4f}")
+        rows.append(r)
     S = pd.DataFrame(rows).set_index("method")
     scsv = analysis_path(run, "query_share_summary.csv")
     S.to_csv(scsv)
     print(f"saved {scsv}")
 
-    f2, ax2 = plt.subplots(1, 2, figsize=(11, 4.2))
-    for axx, (col, lo, hi, ttl) in zip(ax2, [
-            ("diag", "diag_lo", "diag_hi", "target's OWN rows (the boxed diagonal)"),
-            ("offdiag_absmean", "off_lo", "off_hi", "strangers: mean |query - pool| share")]):
-        y = np.arange(len(S))
-        err = np.vstack([S[col] - S[lo], S[hi] - S[col]])
-        axx.errorbar(S[col], y, xerr=err, fmt="o", color="black", ecolor="dimgrey",
-                     capsize=3, ms=5, lw=1.2)
-        axx.axvline(0, color="crimson", lw=0.9, ls="--")
-        axx.set_yticks(y)
-        axx.set_yticklabels([LABEL.get(m, m) for m in S.index], fontsize=9)
-        axx.invert_yaxis()
-        axx.set_title(ttl, fontsize=10)
-        axx.set_xlabel("query share $-$ pool share", fontsize=9)
-        axx.grid(axis="x", alpha=0.25, lw=0.6)
-    f2.suptitle(f"{a.target}: query share minus pool share, mean over targets "
-                f"with 95% bootstrap CI (resampled over the {len(targets)} targets)",
-                fontsize=11)
-    f2.tight_layout(rect=[0, 0, 1, 0.94])
-    out2 = figure_path(run, a.out.replace(".png", "_errorbars.png"))
-    f2.savefig(out2, dpi=160, facecolor="white", bbox_inches="tight")
-    print(f"saved {out2}")
+    # The bootstrap CIs are NOT plotted. The same five numbers and their intervals are
+    # printed above, written to query_share_summary.csv, and already carried in each panel's
+    # title, so a separate two-panel error-bar figure restated them with nothing added.
 
 
 if __name__ == "__main__":
