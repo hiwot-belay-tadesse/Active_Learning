@@ -166,7 +166,7 @@ def reindex(root=RESULTS_ROOT):
     """
     if os.path.exists(INDEX):
         os.remove(INDEX)
-    found = []
+    found, skipped = [], []
     for target in sorted(os.listdir(root)) if os.path.isdir(root) else []:
         tdir = os.path.join(root, target)
         if not os.path.isdir(tdir):
@@ -174,8 +174,18 @@ def reindex(root=RESULTS_ROOT):
         for name in sorted(os.listdir(tdir)):
             path = os.path.join(tdir, name)
             if os.path.exists(os.path.join(path, "config.json")):
-                update_index(path, root=root)
+                try:
+                    update_index(path, root=root)
+                except json.JSONDecodeError as e:
+                    # One malformed config.json must not cost the whole index. Reindex is the
+                    # recovery step after a cluster array drains, so it has to be the one call
+                    # that always completes; the bad folder is named and skipped.
+                    print(f"  skipped {name}: config.json is not valid JSON ({e})")
+                    skipped.append(name)
+                    continue
                 found.append(name)
+    if skipped:
+        print(f"{len(skipped)} run(s) left out of the index: {', '.join(skipped)}")
     return runs(root=root), found
 
 

@@ -67,6 +67,15 @@ QUEUE = [
     # analysis/ and the grid reads them from there with `--refs`.
     ("random",    dict(split=list(range(N_SPLITS)), methods=["random"], refs=[1])),
     ("eu",        dict(split=list(range(N_SPLITS)), methods=["laplace"])),
+    # The epistemic-uncertainty ablation: same Laplace posterior, same owner-coded design, but
+    # the candidate is ranked by its OWN variance x~_c' Sigma x~_c instead of by the reduction
+    # it would buy for the target. It is EU with the evaluation set collapsed to {c}, so the
+    # quantity EU puts in its denominator becomes the objective. Owner-coded on purpose: then
+    # `eu` and `laplace_var` differ ONLY in the criterion, which is what makes it a control.
+    # Caveat for reading the result: the variance branch takes a static top-b of one ranking
+    # (laplace_variance.py:296), with no Sherman-Morrison between picks, so a batch of 3 can be
+    # three adjacent blocks of the same participant. EU does not have that failure mode.
+    ("laplace_var", dict(split=list(range(N_SPLITS)), methods=["laplace_var"])),
     # ("eer",       dict(split=list(range(N_SPLITS)), methods=["eer"])),
     ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
     ("coreset",   dict(split=list(range(N_SPLITS)), methods=["coreset"])),
@@ -90,7 +99,7 @@ QUEUE = [
 # Settings shared by every job. These must match across the queue entries you intend to compare,
 # because the grid overlays curves from different runs on the assumption that split k means the
 # same split everywhere -- which holds only if block/n_seed/seed/rounds/batch agree.
-COMMON = dict(target="computer_work", block=15, rounds=100, batch=3,
+COMMON = dict(target="computer_work", block=15, rounds=10, batch=3,
               n_seed=3, n_seed_pos=1, n_slopes=5, seed=0)
 
 

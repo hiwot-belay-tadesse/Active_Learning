@@ -82,28 +82,98 @@ def build_strategy(name, seed, typiclust_k=TYPICLUST_K, eer_candidates=50):
         return SubSamplingWrapper(
             query_strategy=MonteCarloEER(method="misclassification_loss", random_state=seed),
             max_candidates=eer_candidates, random_state=seed)
-    if name in ("laplace", "laplace_var"):
+    if name in ("laplace", "laplace_var", "laplace_pool", "laplace_people"):
         # Our own strategy: variance reduction under the mixed model's Laplace posterior. The
         # library has nothing posterior-aware for this estimator (EpistemicUncertaintySampling
         # is isinstance-locked to ParzenWindowClassifier / LogisticRegression). Label-free and
         # closed-form, so unlike eer it scores the WHOLE pool -- no SubSamplingWrapper.
+        #
+        # All three are the same class; what differs is the criterion and, for laplace_pool,
+        # the evaluation set passed at query time (see run_target):
+        #   laplace       reduction of variance summed over the TARGET's unlabelled rows
+        #   laplace_pool  the same, summed over EVERY unlabelled row -- X_eval=None, which the
+        #                 strategy fills with the whole unlabelled pool. A-optimality for the
+        #                 cohort, not for one person, so nothing in it prefers the target.
+        #                 Weighted by ROWS, so a participant counts in proportion to the blocks
+        #                 they contributed (~492 of ~11000 for the largest).
+        #   laplace_people  the cohort objective with every PARTICIPANT weighted equally
+        #                 instead -- pi uniform in M = sum_u pi_u M_u. Same cost; a different
+        #                 objective, not a better estimate of the same one.
+        #   laplace_var   no evaluation set at all: the candidate's OWN posterior variance
         from laplace_variance import LaplaceVarianceReduction
         return LaplaceVarianceReduction(
-            criterion="variance" if name == "laplace_var" else "reduction", random_state=seed)
+            criterion="variance" if name == "laplace_var" else "reduction",
+            eval_weighting="persons" if name == "laplace_people" else "rows",
+            random_state=seed)
     raise ValueError(f"unknown acquisition {name!r}")
+
+
+def block_days(day, W):
+    """The day of each BLOCK, from the day of each minute. -> (n_blocks,)
+
+    ``tr_day`` is the minute-level vector: ``preprocess_data._block_split`` blocks each side of
+    the split and throws the blocked day vector away, so it is the only one the run carries, and
+    it is 15x too long to index a participant's blocks with. This reconstructs the one
+    ``block_rows`` built -- unique days in sorted order, ceil(n_d / W) blocks within each -- so
+    that "spread the seed over days" means days and not row positions.
+    """
+    day = np.asarray(day)
+    if W <= 1:
+        return day
+    out = []
+    for d in np.unique(day):
+        out += [d] * int(np.ceil(np.sum(day == d) / W))
+    return np.asarray(out)
+
+
+def initial_labels(sp, tgt_uuid, own, tr_day, rng, args):
+    """The rows already labelled when round 1 begins. -> (row indices, flagged).
+
+    ``--seed_source self`` is the default and the recipe every existing run used: ``n_seed`` of
+    the TARGET's own labels, ``n_seed_pos`` of them positive, spread over the target's days.
+
+    ``--seed_source cohort`` spreads the seed over the whole cohort instead: ``n_seed_per_person``
+    blocks from EVERY participant, the target included, drawn from distinct days where they have
+    them. The size is therefore set by the cohort, not by ``n_seed`` -- 2 x 43 = 86 labels on a
+    43-participant split, of which 2 are the target's own -- so the model starts knowing the
+    population rather than the person. No class balance is imposed: at a cohort-wide positive
+    rate both classes arrive on their own, and forcing a positive per participant would inflate
+    the seed's base rate above the real one.
+    """
+    if args.seed_source == "self":
+        loc, flagged = seed_set(sp.y[own], tr_day[tgt_uuid], rng, args.n_seed, args.n_seed_pos)
+        return own[loc], flagged
+    take = []
+    for u in sp.users:                       # sp.users is fixed order, so the draw is reproducible
+        rows = sp.rows_of(u)
+        n = min(args.n_seed_per_person, len(rows))
+        if n == 0:
+            continue
+        day = block_days(tr_day[u], args.block)
+        assert len(day) == len(rows), f"{len(day)} block days for {len(rows)} blocks of {u}"
+        chosen = []
+        for d in rng.permutation(np.unique(day)):          # one per day first, as seed_set does
+            chosen.append(rng.choice(rows[day == d]))
+            if len(chosen) >= min(n, len(np.unique(day))):
+                break
+        rest = np.setdiff1d(rows, chosen)
+        if n > len(chosen) and len(rest):
+            chosen += list(rng.choice(rest, min(n - len(chosen), len(rest)), replace=False))
+        take += list(chosen)
+    return np.array(sorted(set(take)), dtype=int), False
 
 
 def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
     """One participant's learning curves: every method, from the same seed set. -> (rows, queries).
 
-    The seed set is the target's OWN labels, identical across methods so the curves start from
-    the same model; everything after round 0 is the acquisition's doing.
+    The seed set is identical across methods so the curves start from the same model; everything
+    after round 0 is the acquisition's doing. Where those initial labels come from -- the target's
+    own days, or every participant alike -- is ``--seed_source`` (see :func:`initial_labels`).
     """
     pid = sp.ids[tgt_uuid]
     own = sp.rows_of(tgt_uuid)
     rng = np.random.default_rng([args.seed, split_id, int(pid[1:]), 11])
-    loc, flagged = seed_set(sp.y[own], tr_day[tgt_uuid], rng, args.n_seed, args.n_seed_pos)
-    seed_rows = own[loc]
+    seed_rows, flagged = initial_labels(sp, tgt_uuid, own, tr_day, rng, args)
 
     # The acquisition's RNG, keyed on the TARGET as well as the split. It used to be
     # `args.seed + split_id`, one integer shared by all 43 targets, which made RandomSampling
@@ -127,7 +197,14 @@ def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
     # target-coded one: its criterion reads the candidate's own random-effect columns, so
     # recoding every candidate as the target (what eer needs) would erase exactly the
     # provenance term that makes it interesting. See laplace_variance.py, `Candidate coding`.
-    LAPLACE_STRATEGIES = {"laplace", "laplace_var"}
+    LAPLACE_STRATEGIES = {"laplace", "laplace_var", "laplace_pool", "laplace_people"}
+    # laplace_pool and laplace_people widen the evaluation set to EVERY unlabelled row, each
+    # kept under its own owner's code (Xclf is owner-coded, so slicing it is enough), making the
+    # criterion a population design instead of a target-specific one -- the control for "is EU's
+    # self-preference a consequence of WHOSE variance it is reducing?". They differ only in
+    # eval_weighting, set in build_strategy. X_eval is passed explicitly rather than left to the
+    # strategy's own default so that what the objective is does not depend on a default.
+    POOL_EVAL = {"laplace_pool", "laplace_people"}
     rows, queries = [], []
     for method in args.methods:
         qs = build_strategy(method, strat_seed, args.typiclust_k, args.eer_candidates)
@@ -144,9 +221,13 @@ def run_target(sp, tgt_uuid, tr_day, slope_idx, args, split_id):
                     own_unl = own[np.isnan(y_al[own])]
                     # fit_clf=False: `clf` below was already fitted on (Xclf, y_al) at the end
                     # of the previous round, so refitting here would just repeat it.
+                    if method in POOL_EVAL:
+                        unl = np.flatnonzero(np.isnan(y_al))
+                        X_eval = Xclf[unl] if len(unl) else None
+                    else:
+                        X_eval = Xclf[own_unl] if len(own_unl) else None
                     idx = qs.query(X=Xclf, y=y_al, clf=clf, fit_clf=False,
-                                   X_eval=Xclf[own_unl] if len(own_unl) else None,
-                                   batch_size=args.batch)
+                                   X_eval=X_eval, batch_size=args.batch)
                 elif method in CLF_STRATEGIES:
                     # the model reads the participant code from the last column, so a
                     # model-based strategy must be given that matrix -- and every candidate is
@@ -209,13 +290,19 @@ def main():
     ap.add_argument("--block", type=int, default=BLOCK_W, help="W: minutes per block (1 = none)")
     ap.add_argument("--methods", nargs="+", default=list(METHODS),
                     choices=["typiclust", "coreset", "probcover", "eer", "laplace", "laplace_var",
-                             "random"])
+                             "laplace_pool", "laplace_people", "random"])
     ap.add_argument("--splits", type=int, default=1, help="independent day splits to average over")
     ap.add_argument("--first_split", type=int, default=0)
     ap.add_argument("--rounds", type=int, default=ROUNDS)
     ap.add_argument("--batch", type=int, default=BATCH, help="labels bought per round")
     ap.add_argument("--n_seed", type=int, default=N_SEED)
     ap.add_argument("--n_seed_pos", type=int, default=N_SEED_POS)
+    ap.add_argument("--seed_source", default="self", choices=["self", "cohort"],
+                    help="where the INITIAL labels come from: 'self' (default) n_seed of the "
+                         "target's own days, or 'cohort' n_seed_per_person blocks from every "
+                         "participant, the target included")
+    ap.add_argument("--n_seed_per_person", type=int, default=2,
+                    help="--seed_source cohort: blocks taken from EACH participant")
     ap.add_argument("--n_slopes", type=int, default=N_SLOPES)
     ap.add_argument("--typiclust_k", type=int, default=TYPICLUST_K)
     ap.add_argument("--eer_candidates", type=int, default=50,
@@ -246,13 +333,17 @@ def main():
 
     t = get_target(args.target)
     args.target = t.name                                   # the registry name, not the alias
+    if args.seed_source != "self" and args.tag is None:
+        args.tag = f"seed_{args.seed_source}"   # a new seeding never lands on a finished run
     out = args.out or run_dir(t.name, args.block, args.methods, args.rounds, args.batch,
                               args.n_slopes, args.tag, reserve=args.reserve)
     os.makedirs(out, exist_ok=True)
     cfg = write_config(out, args)
+    seed_desc = (f"{args.n_seed} own seed" if args.seed_source == "self"
+                 else f"{args.n_seed_per_person}/participant cohort seed")
     print(f"{t.name}: {' vs '.join(args.methods)}, W={args.block}, "
-          f"{args.n_seed} seed + {args.rounds} x {args.batch} = "
-          f"{args.n_seed + args.rounds * args.batch} labels, {args.splits} split(s)")
+          f"{seed_desc} + {args.rounds} x {args.batch} = "
+          f"{args.rounds * args.batch} acquired, {args.splits} split(s)")
     print(f"  -> {out}", flush=True)
 
     data, cols = load(t, verbose=True)

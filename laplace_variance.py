@@ -35,6 +35,17 @@ and we query the candidate maximising it. Three consequences worth knowing:
   criterion says on its own that a stranger's label helps the target via the population
   parameters while the target's own label helps via both. See `Candidate coding` below -- this
   only holds if you hand it the true owner codes.
+* **The evaluation set is a free argument.** ``X_eval`` is whose variance you are reducing. The
+  target's own unlabelled blocks give the personalised criterion; EVERY participant's unlabelled
+  rows, each coded to its own owner, give the population design (A-optimality for the cohort).
+  For the cohort, ``sum_e (xt_e' S xt_c)^2`` is evaluated through the scatter matrix
+  M = sum_e a_e xt_e xt_e', so that the cost stops depending on |E|:
+
+      sum_e a_e (xt_e' S xt_c)^2 = xt_c' S M S xt_c.
+
+  ``eval_weighting`` sets a_e, i.e. pi in M = sum_u pi_u M_u: ``"rows"`` weights participants by
+  how many blocks they happened to contribute, ``"persons"`` weights them equally. See
+  ``notes/eu_acquisition.tex``, section `Reducing variance for the whole cohort`.
 * **It is A-optimality on the linear predictor, not on AUROC.** Shrinking var(eta) is a proxy
   for better ranking, not the same thing. Being label-free it also will not preferentially hunt
   positives, which at ~16% prevalence is a real behavioural difference from
@@ -230,17 +241,26 @@ class LaplaceVarianceReduction(SingleAnnotatorPoolQueryStrategy):
         Passed to :func:`laplace_cov`.
     jitter : float, default=0.0
         Ridge added to the Hessian before inversion, for an ill-conditioned early-round fit.
+    eval_weighting : {"rows", "persons"}, default="rows"
+        How the rows of ``X_eval`` are weighted in the scatter matrix -- ``pi`` in
+        ``M = sum_u pi_u M_u``. ``"rows"`` gives every evaluation row weight 1, so the objective
+        is A-optimality under the POOL's empirical measure and a participant counts in
+        proportion to the blocks they contributed (on ``computer_work`` the largest contributes
+        ~492 of ~11000). ``"persons"`` divides each row by its owner's count, so every
+        participant counts equally. Only matters when ``X_eval`` spans more than one person;
+        for a single-target evaluation set the two are identical up to a constant.
     missing_label, random_state
         Standard scikit-activeml arguments. ``random_state`` breaks ties and drives the uniform
         fallback when the model could not be fitted.
     """
 
     def __init__(self, criterion="reduction", cov_method="hessian", jitter=0.0,
-                 missing_label=MISSING_LABEL, random_state=None):
+                 eval_weighting="rows", missing_label=MISSING_LABEL, random_state=None):
         super().__init__(missing_label=missing_label, random_state=random_state)
         self.criterion = criterion
         self.cov_method = cov_method
         self.jitter = jitter
+        self.eval_weighting = eval_weighting
 
     def query(self, X, y, clf, fit_clf=True, candidates=None, X_eval=None,
               batch_size=1, return_utilities=False):
@@ -257,8 +277,14 @@ class LaplaceVarianceReduction(SingleAnnotatorPoolQueryStrategy):
             Fit ``clf`` on ``(X, y)`` first. ``False`` uses the posterior already on ``clf``.
         X_eval : array-like, shape (n_eval, n_features + 1), optional
             Rows whose predictive variance is to be reduced -- for a personalised run, the
-            target's own unlabelled blocks. Defaults to the unlabelled candidates, which makes
-            the criterion pool-average rather than target-specific.
+            target's own unlabelled blocks; for the cohort design, every participant's
+            unlabelled rows, EACH CODED TO ITS OWN OWNER (the person column is read from the
+            last column, so passing the owner-coded pool is all that is needed; pooling the
+            rows but coding them all to the target would shrink the variance of a person who
+            does not exist). Defaults to the unlabelled candidates, which makes the criterion
+            pool-average rather than target-specific.
+            Large evaluation sets are free: the cross term is evaluated through the scatter
+            matrix, so the per-pick cost is O(n_cand d^2 + d^3) regardless of |E|.
         batch_size : int, default=1
             Picked greedily, re-applying the rank-one update after each pick.
 
@@ -275,6 +301,9 @@ class LaplaceVarianceReduction(SingleAnnotatorPoolQueryStrategy):
         if self.criterion not in ("reduction", "variance"):
             raise ValueError(f"criterion must be 'reduction' or 'variance', "
                              f"got {self.criterion!r}")
+        if self.eval_weighting not in ("rows", "persons"):
+            raise ValueError(f"eval_weighting must be 'rows' or 'persons', "
+                             f"got {self.eval_weighting!r}")
 
         if fit_clf:
             clf = clf.fit(X, y)
@@ -302,14 +331,31 @@ class LaplaceVarianceReduction(SingleAnnotatorPoolQueryStrategy):
         if X_eval is None:
             lab = is_labeled(y, missing_label=self.missing_label_)
             X_eval = X[~lab] if mapping is not None else X_cand
-        Xt_eval = self._design(np.asarray(X_eval, float), clf, res)
+        X_eval = np.asarray(X_eval, float)
+        Xt_eval = self._design(X_eval, clf, res)
+        a = self._eval_weights(X_eval)
+
+        # Two algebraically identical routes to sum_e a_e (xt_e' S xt_c)^2, see eq. (scatter):
+        # row-wise costs O(|E| d n_cand) per pick, the scatter matrix O(n_cand d^2 + d^3). The
+        # crossover is |E| ~ d, which is also where the (|E|, n_cand) intermediate stops fitting
+        # in memory: at |E| = n_cand = 11000 it is ~1 GB and the matmul ~5e13 flops.
+        d = Xt_eval.shape[1]
+        use_scatter = len(Xt_eval) > d
+        if use_scatter:
+            M = Xt_eval.T @ (a[:, None] * Xt_eval)                # (d, d), fixed within a batch
+        else:
+            Xt_eval = np.sqrt(a)[:, None] * Xt_eval               # fold the weights into E
 
         picked, util_rows = [], []
         S = Sigma
         for _ in range(batch_size):
             SC = S @ Xt_cand.T                                    # (d, n_cand)
             quad = np.einsum("ij,ji->i", Xt_cand, SC)             # xt_c' S xt_c
-            cross = ((Xt_eval @ SC) ** 2).sum(axis=0)             # sum_e (xt_e' S xt_c)^2
+            if use_scatter:
+                SMS = S @ M @ S
+                cross = np.einsum("ij,jk,ik->i", Xt_cand, SMS, Xt_cand)   # xt_c' S M S xt_c
+            else:
+                cross = ((Xt_eval @ SC) ** 2).sum(axis=0)         # sum_e a_e (xt_e' S xt_c)^2
             delta = w * cross / (1.0 + w * quad)
             delta[picked] = -np.inf                               # no repeats within a batch
             row = np.where(np.isfinite(delta), delta, np.nan)
@@ -339,6 +385,22 @@ class LaplaceVarianceReduction(SingleAnnotatorPoolQueryStrategy):
         who = [persons[int(c)] for c in Xp[:, -1]]
         return stack_design(Xp[:, :-1], who, res)
 
+    def _eval_weights(self, X_eval):
+        """-> a, the per-row weight of the evaluation set. ``pi`` of eq. (mmix), per row.
+
+        ``"rows"``: all ones -- A-optimality under the pool's empirical measure.
+        ``"persons"``: 1 / (U |E_u|) for a row owned by u, so each of the U participants present
+        contributes M_u = mean of xt xt' over their own rows with equal weight. The 1/U is a
+        constant and does not change the argmax; it is kept so that Delta stays comparable in
+        magnitude to the per-person criterion.
+        """
+        n = len(X_eval)
+        if self.eval_weighting == "rows":
+            return np.ones(n)
+        who = np.asarray(X_eval[:, -1], float)
+        uniq, inv, cnt = np.unique(who, return_inverse=True, return_counts=True)
+        return 1.0 / (len(uniq) * cnt[inv].astype(float))
+
     @staticmethod
     def _weights(Xp, clf):
         """w_c = mu_c (1 - mu_c) at the current mode."""
@@ -357,6 +419,8 @@ def _self_test():
          (Xt' W Xt + Lam)^-1 as claimed, and our Lam matches statsmodels' priors.
       2. the Sherman-Morrison step == an explicit re-inversion of (H + w xt xt').
       3. Delta(c) == the drop in summed evaluation variance that step actually produces.
+      4. the scatter-matrix cross term == the row-wise one, for both weightings -- the identity
+         that makes a cohort-wide evaluation set affordable.
 
     What this does NOT check is whether the Laplace Gaussian is a good approximation to the true
     posterior, or whether reducing var(eta) improves AUROC. Neither is checkable here.
@@ -418,7 +482,27 @@ def _self_test():
     print(f"\n2. Sherman-Morrison vs re-inversion  max|diff| = {worst_S:.2e}  (12 candidates)")
     print(f"3. Delta(c) vs realised variance drop max|diff| = {worst_d:.2e}  (40 eval rows)")
 
-    ok = np.abs(Sh - Sa).max() < 1e-6 and worst_S < 1e-8 and worst_d < 1e-8
+    # 4. scatter matrix vs row-wise, on the WHOLE pool as the evaluation set (the cohort case),
+    #    for both weightings. Xp carries the person code in the last column, as the strategy
+    #    expects; persons here are strings, so map them to their index in `users`.
+    users = sorted(set(people))
+    code = np.array([users.index(q) for q in people], float)
+    Xp = np.hstack([Z, code[:, None]])
+    worst_m = 0.0
+    for weighting in ("rows", "persons"):
+        qs = LaplaceVarianceReduction(eval_weighting=weighting)
+        a = qs._eval_weights(Xp)
+        M = Xt.T @ (a[:, None] * Xt)
+        SMS = Sh @ M @ Sh
+        compact = np.einsum("ij,jk,ik->i", Xt, SMS, Xt)
+        rowwise = (((np.sqrt(a)[:, None] * Xt) @ (Sh @ Xt.T)) ** 2).sum(axis=0)
+        worst_m = max(worst_m, np.abs(compact - rowwise).max() / max(1.0, np.abs(rowwise).max()))
+        print(f"4. scatter vs row-wise [{weighting:>7}]      max|rel diff| = "
+              f"{np.abs(compact - rowwise).max() / max(1.0, np.abs(rowwise).max()):.2e}"
+              f"   ({len(Xt)} eval rows, {len(users)} people)")
+
+    ok = (np.abs(Sh - Sa).max() < 1e-6 and worst_S < 1e-8 and worst_d < 1e-8
+          and worst_m < 1e-10)
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
