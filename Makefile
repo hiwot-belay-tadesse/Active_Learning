@@ -20,7 +20,10 @@
 # nothing in cluster/run.py has to be commented out. Use `submit`/`local` when you want the
 # whole queue, which is what the cluster array runs.
 
-PY      ?= ./.venv/bin/python
+# The local .venv when there is one, else whatever python is active -- so an activated mamba
+# env is used as-is on a cluster checkout, which has no .venv. Nothing here activates anything.
+# `make python` prints the choice; override with PY=... .
+PY      ?= $(shell [ -x ./.venv/bin/python ] && echo ./.venv/bin/python || command -v python)
 TARGET  ?= computer_work
 BLOCK   ?= 15
 METHOD  ?= laplace random
@@ -54,15 +57,17 @@ CPART   ?= shared
 CMEM    ?= 16000
 # Task ids. Override to re-run specific splits (ARRAY=3,7,11) or to cap concurrency (0-19%5).
 ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) - 1 )))
-# The cluster checkout: $(CENV) is activated, $(CDATA) is where the ExtraSensory CSVs live.
-CENV    ?= al
-CDATA   ?= $$HOME/Active_Learning_new/DATA/ExtraSensory
+# Activate your env and export ES_DATA_DIR before submitting: sbatch passes the submitting
+# environment to the job, so nothing here activates anything.
 
 TAGFLAG := $(if $(TAG),--tag $(TAG),)
 ONLYFLAG := $(if $(ONLY),--only $(ONLY),)
 RUNFLAG := $(if $(RUN),--run $(RUN),--contains r$(ROUNDS)x$(BATCH))
 
-.PHONY: help run submit submit_cohort dry_cohort local dry refs sweep grid bar reindex selftest clean-logs
+.PHONY: help run submit submit_cohort dry_cohort local dry refs python sweep grid bar reindex selftest clean-logs
+
+python:
+	@echo $(PY)
 
 help:
 	@sed -n '2,21p' Makefile | sed 's/^# \{0,1\}//'
@@ -94,15 +99,14 @@ dry:
 COHORT_SB = -J cohort_al --array=$(ARRAY) -n 1 -N 1 -t $(CTIME) -p $(CPART) --mem=$(CMEM) \
 	    -o cluster/logs/cohort/out_%A_%a.txt -e cluster/logs/cohort/err_%A_%a.txt
 COHORT_WRAP = set -e; export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; \
-	export ES_DATA_DIR=$(CDATA); \
-	module load Miniforge3 2>/dev/null || module load Mambaforge 2>/dev/null || true; \
-	source activate $(CENV); \
-	python -u cohort_al.py --target $(TARGET) --methods $(CMETHOD) --rounds $(CROUNDS) \
+	$(PY) -u cohort_al.py --target $(TARGET) --methods $(CMETHOD) --rounds $(CROUNDS) \
 	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 \
 	--first_split $$SLURM_ARRAY_TASK_ID --resume --no_index
 
 submit_cohort:
 	@mkdir -p cluster/logs/cohort
+	@test -n "$$ES_DATA_DIR" || echo 'WARNING: ES_DATA_DIR is unset -- the job will not find the CSVs'
+	@echo "submitting with $(PY)"
 	sbatch $(COHORT_SB) --wrap '$(COHORT_WRAP)'
 
 dry_cohort:

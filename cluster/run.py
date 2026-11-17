@@ -19,9 +19,8 @@ DRYRUN = False
 # SLURM stdout/stderr only; results go where paths.run_dir() puts them
 LOG_DIR = os.path.join(REPO, "cluster", "logs")
 
-# .venv by default (skactiveml needs sklearn >= 1.6); on the cluster set
-# AL_PYTHON=$(which python) after activating the env
-PYTHON = os.environ.get("AL_PYTHON") or os.path.join(REPO, ".venv", "bin", "python")
+# whichever interpreter is submitting, by absolute path, so the job needs no activation
+PYTHON = os.environ.get("AL_PYTHON") or sys.executable
 
 N_SPLITS = 20
 
