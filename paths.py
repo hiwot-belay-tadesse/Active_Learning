@@ -50,15 +50,36 @@ def run_id(target, block, methods, rounds, batch, n_slopes, tag=None):
     return "_".join(parts)
 
 
+# One level between the target and the run folder, so `results/computer_work/` does not become
+# a flat list of thirty near-identical names. The three scopes are the three designs:
+#
+#   personal     one participant: their own pool, their own model (personal_al.py)
+#   global       one model PER TARGET, personalised, buying from the whole cohort (main.py)
+#   full_global  ONE model for everybody, one acquisition stream for the cohort (cohort_al.py)
+#
+# Discovery accepts a run at either depth, so folders written before this existed keep working.
+SCOPES = ("global", "personal", "full_global")
+
+
 def run_dir(target, block, methods, rounds, batch, n_slopes, tag=None, root=RESULTS_ROOT,
-            create=True, reserve=False):
+            create=True, reserve=False, scope=None, name=None):
     """-> the directory for this configuration, created if needed.
 
     reserve=True never reuses a directory that already holds results: it appends _run2, _run3,
     ... instead. Use it when a previous run must not be touched; leave it off to resume.
+
+    scope is "global" or "personal" and becomes a folder between the target and the run; None
+    writes directly under the target, the layout used before scopes existed.
+
+    name replaces the derived folder name outright. The derived name encodes every setting that
+    changes the numbers, which is what makes two runs of one configuration land in the same
+    folder and resume each other -- so a caller that passes `name` takes that job on itself:
+    two different configurations under one name will merge silently.
     """
-    rid = run_id(target, block, methods, rounds, batch, n_slopes, tag)
-    path = os.path.join(root, str(target), rid)
+    if scope is not None and scope not in SCOPES:
+        raise ValueError(f"scope must be one of {SCOPES} or None, got {scope!r}")
+    rid = name or run_id(target, block, methods, rounds, batch, n_slopes, tag)
+    path = os.path.join(root, str(target), *( (scope,) if scope else () ), rid)
     if reserve and _has_results(path):
         i = 2
         while _has_results(f"{path}_run{i}"):
@@ -156,6 +177,27 @@ def update_index(path, cfg=None, root=RESULTS_ROOT):
     return idx
 
 
+def run_glob(target, *parts, root=RESULTS_ROOT):
+    """Glob inside every run folder of one target, whatever depth it sits at.
+
+    ``run_glob("computer_work", "*cohort*", "queries_split*.csv")`` matches both
+    ``<root>/computer_work/<run>/queries_split0.csv`` and
+    ``<root>/computer_work/global/<run>/queries_split0.csv``. Callers that used to build the
+    one-level pattern themselves silently stopped finding anything once runs moved into a
+    scope folder, which is the sort of failure that reads as "the run is missing".
+    """
+    import glob as _glob
+    base = os.path.join(root, str(target))
+    hits = set(_glob.glob(os.path.join(base, *parts)))
+    hits |= set(_glob.glob(os.path.join(base, "*", *parts)))
+    return sorted(hits)
+
+
+def run_folders(target, pattern="*", root=RESULTS_ROOT):
+    """-> the run DIRECTORIES of one target, at either depth, newest-sorted by name."""
+    return [d for d in run_glob(target, pattern, root=root) if os.path.isdir(d)]
+
+
 def reindex(root=RESULTS_ROOT):
     """Rebuild results/index.csv from the run folders actually on disk. -> the index frame.
 
@@ -171,8 +213,20 @@ def reindex(root=RESULTS_ROOT):
         tdir = os.path.join(root, target)
         if not os.path.isdir(tdir):
             continue
+        # A directory holding config.json is a run; one that does not is a scope folder, so
+        # look one level inside it. Nothing deeper is searched -- two levels is the layout.
+        candidates = []
         for name in sorted(os.listdir(tdir)):
             path = os.path.join(tdir, name)
+            if not os.path.isdir(path):
+                continue
+            if os.path.exists(os.path.join(path, "config.json")):
+                candidates.append((name, path))
+            else:
+                candidates += [(f"{name}/{sub}", os.path.join(path, sub))
+                               for sub in sorted(os.listdir(path))
+                               if os.path.isdir(os.path.join(path, sub))]
+        for name, path in candidates:
             if os.path.exists(os.path.join(path, "config.json")):
                 try:
                     update_index(path, root=root)
@@ -198,10 +252,21 @@ def runs(target=None, root=RESULTS_ROOT):
 
 
 def find_run(target=None, contains=None, root=RESULTS_ROOT):
-    """Absolute path of the most recently updated run matching the filters."""
+    """Absolute path of the most recently updated run matching the filters.
+
+    Everything here reads results/index.csv, which the cluster jobs deliberately do NOT write
+    (they run with --no_index to avoid racing on one file). An empty or missing index therefore
+    means "nobody has reindexed yet", not "no results" -- and it used to surface as a bare
+    KeyError: 'run' from the filter below, which says nothing about the fix.
+    """
     idx = runs(target, root)
+    if not len(idx) or "run" not in idx:
+        raise FileNotFoundError(
+            f"results index {INDEX} is empty or missing -- nothing to search.\n"
+            f"  Cluster jobs run with --no_index, so rebuild it first:  make reindex\n"
+            f"  (or pass the folder directly:  --run results/<target>/global/<run folder>)")
     if contains:
-        idx = idx[idx["run"].str.contains(contains, regex=False)]
+        idx = idx[idx["run"].astype(str).str.contains(contains, regex=False)]
     if not len(idx):
         raise FileNotFoundError(f"no run for target={target!r} contains={contains!r} under {root}")
     return os.path.join(root, idx.sort_values("updated").iloc[-1]["path"])

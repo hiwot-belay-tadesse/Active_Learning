@@ -1,0 +1,15 @@
+# Recomputable from the code plus the data, and large. `results/` is already covered by the
+# repo-level .gitignore; these two are specific to this subdirectory.
+#
+# NOTE: gitignore has no trailing comments -- "cache/   # why" is a pattern with a comment in
+# it, matching nothing. Comments get their own line.
+
+# per-split row attributes, rebuilt by pool_attributes.py in ~40 s per split
+cache/
+
+# one log per split per run
+logs/
+
+# The derived tables under diagnosis/ ARE kept: they are the numbers PROPOSAL.md cites, they are
+# small, and a reader should not have to re-run 100 split-jobs to check a figure in the text.
+# The figures themselves are covered by the repo-level *.png rule.

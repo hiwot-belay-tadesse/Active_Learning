@@ -3,18 +3,10 @@
     python cluster/submit_batch.py            # from the repo root
     python cluster/submit_batch.py --dry      # print the jobs, submit nothing
 
-Adapted from odyssey-tools/automatic-submission/submit_batch.py, with three changes made
-because the original's assumptions do not hold here:
-
-* The generated script is named after the FULL parameter set, not just the queue entry. Upstream
-  writes ``tmp/slurm_<exp_name>.sh`` for every combination, so 20 splits overwrite one file --
-  harmless only because sbatch reads it before the next iteration rewrites it, and unrecoverable
-  afterwards when you want to know what was actually submitted.
-* ``exp_dir`` holds SLURM logs only. Upstream puts results there and tells you in a docstring to
-  make the directory a function of the kwargs; here ``paths.run_dir()`` already owns the results
-  layout, and every split of one queue entry belongs in the SAME run folder.
-* Jobs are submitted with ``--no_index``; call ``python paths.py --reindex`` once the array has
-  drained. Otherwise 20 jobs race on results/index.csv.
+Adapted from odyssey-tools/automatic-submission. Differences: the generated script is named
+after the full parameter set (upstream overwrites one file per queue entry), exp_dir holds SLURM
+logs only, and jobs run with --no_index -- call `python paths.py --reindex` once the array has
+drained.
 """
 import argparse
 import copy
@@ -61,8 +53,6 @@ def submit_job(template, exp_name, exp_kwargs, dry=False):
         print(f"  would submit {name}: {' '.join(command(exp_kwargs))}")
         return
     if not DRYRUN:
-        # subprocess raises FileNotFoundError when sbatch is absent, which reads like a bug in
-        # this script rather than "you are not on the cluster". Say the useful thing instead.
         if shutil.which("sbatch") is None:
             raise SystemExit(
                 "sbatch not found -- this machine has no SLURM.\n"
@@ -79,6 +69,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry", action="store_true", help="print the jobs, submit nothing")
+    ap.add_argument("--only", default=None, metavar="SUBSTR",
+                    help="submit only the jobs whose name contains SUBSTR (the name --dry "
+                         "prints), e.g. `--only eu_split0`. Matching nothing is an error.")
     a = ap.parse_args()
 
     for label, path in (("repo", HERE), ("python", PYTHON)):
@@ -90,13 +83,20 @@ def main():
     with open(TEMPLATE) as fh:
         template = fh.read()
 
-    n = 0
+    n, skipped = 0, 0
     for exp_name, params in QUEUE:
         for vals in itertools.product(*list(params.values())):
-            submit_job(template, exp_name, dict(zip(params.keys(), vals)), dry=a.dry)
+            kw = dict(zip(params.keys(), vals))
+            if a.only and a.only not in job_name(exp_name, kw):
+                skipped += 1
+                continue
+            submit_job(template, exp_name, kw, dry=a.dry)
             n += 1
+    if a.only and n == 0:
+        raise SystemExit(f"--only {a.only!r} matched none of the {skipped} job(s) in QUEUE; "
+                         f"run with --dry to see the names")
     mode = "printed" if a.dry else ("ran locally (DRYRUN)" if DRYRUN else "submitted")
-    print(f"{n} job(s) {mode}")
+    print(f"{n} job(s) {mode}" + (f" ({skipped} skipped by --only)" if a.only else ""))
     if not a.dry and not DRYRUN:
         print("when the array drains:  python paths.py --reindex")
 

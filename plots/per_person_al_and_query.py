@@ -58,7 +58,7 @@ import pandas as pd                                                      # noqa:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from load_data import get_target, load                                   # noqa: E402
-from paths import RESULTS_ROOT, figure_path                              # noqa: E402
+from paths import RESULTS_ROOT, figure_path, run_folders, run_glob                              # noqa: E402
 from preprocess_data import canonical_ids, prepare_one                   # noqa: E402
 
 ORDER = ["laplace", "eer", "typiclust", "coreset", "probcover", "random"]
@@ -135,8 +135,8 @@ def main():
     MET = {"auroc": "AUROC", "auprc": "AUPRC"}[a.metric]
 
     root = os.path.join(RESULTS_ROOT, a.target)
-    qf = sorted(glob.glob(os.path.join(root, f"*{a.contains}*", "queries_split*.csv")))
-    rf = sorted(glob.glob(os.path.join(root, f"*{a.contains}*", "per_round_split*.csv")))
+    qf = run_glob(a.target, f"*{a.contains}*", "queries_split*.csv")
+    rf = run_glob(a.target, f"*{a.contains}*", "per_round_split*.csv")
     if not qf:
         raise SystemExit(f"no queries_split*.csv under {root}/*{a.contains}*")
     Q = pd.concat([pd.read_csv(f).assign(_src=f) for f in qf], ignore_index=True) \
@@ -187,7 +187,7 @@ def main():
         return None, sorted(set(D.target), key=lambda z: int(z[1:])), by
     nrow = a.rows
     ncol = int(np.ceil(len(set(D.target)) / nrow))
-    run = a.run or sorted(glob.glob(os.path.join(root, f"*laplace*{a.contains}*")))[0]
+    run = a.run or run_folders(a.target, f"*laplace*{a.contains}*")[0]
     print(f"{D.target.nunique()} targets, rounds 0-{R}, panel order by {a.order_by}")
 
     # Chance for AUPRC is the test set's positive rate, which differs per target, so an AUPRC

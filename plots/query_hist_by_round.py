@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt                                          # noqa:
 import numpy as np                                                       # noqa: E402
 import pandas as pd                                                      # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import analysis_path, figure_path                             # noqa: E402
 
@@ -64,59 +65,9 @@ if a.targets:
     if not targets:
         raise SystemExit(f"none of {a.targets} is a target in this run")
 
-def _lab(rgb):
-    """sRGB (n, 3) in [0, 1] -> CIELAB, so colours are compared the way an eye compares them.
-
-    Euclidean distance in RGB is a poor proxy: tab20's blue/light-blue pair is far apart in RGB
-    and nearly indistinguishable on the page, which is exactly the failure this palette is
-    meant to avoid.
-    """
-    c = np.asarray(rgb, float)[:, :3]
-    c = np.where(c > 0.04045, ((c + 0.055) / 1.055) ** 2.4, c / 12.92)
-    M = np.array([[0.4124, 0.3576, 0.1805],
-                  [0.2126, 0.7152, 0.0722],
-                  [0.0193, 0.1192, 0.9505]])
-    xyz = c @ M.T / np.array([0.95047, 1.0, 1.08883])
-    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
-    return np.stack([116 * f[:, 1] - 16,
-                     500 * (f[:, 0] - f[:, 1]),
-                     200 * (f[:, 1] - f[:, 2])], axis=1)
+from palette import distinct_colors                                     # noqa: E402
 
 
-def distinct_colors(n):
-    """-> n colours chosen to be as far apart as possible, in a fixed order.
-
-    Taking the first n entries of tab20 + tab20b + tab20c (the previous choice) hands out
-    tab20's light/dark PAIRS and tab20b/c's near-identical quartets, so neighbouring stack
-    segments -- and, worse, the target's own block against its donors -- came out in shades of
-    one hue. Instead, pool nine qualitative maps and pick greedily by farthest-point in
-    CIELAB: each new colour is the candidate whose nearest already-chosen colour is furthest
-    away. Deterministic, so a participant keeps their colour across figures and runs.
-
-    Near-white and near-black candidates are dropped first: white collides with the segment
-    edges and black with the self block's outline.
-    """
-    pool = np.vstack([plt.get_cmap(c)(np.linspace(0, 1, k)) for c, k in
-                      (("tab20", 20), ("tab20b", 20), ("tab20c", 20), ("Set1", 9),
-                       ("Set2", 8), ("Set3", 12), ("Dark2", 8), ("Accent", 8),
-                       ("Paired", 12))])[:, :3]
-    pool = np.unique(np.round(pool, 6), axis=0)
-    L = _lab(pool)
-    pool, L = pool[(L[:, 0] > 22) & (L[:, 0] < 93)], L[(L[:, 0] > 22) & (L[:, 0] < 93)]
-    if n > len(pool):
-        raise SystemExit(f"only {len(pool)} usable colours for {n} participants")
-    start = int(np.argmax(np.linalg.norm(L - L.mean(axis=0), axis=1)))
-    picked = [start]
-    d = np.linalg.norm(L - L[start], axis=1)
-    for _ in range(n - 1):
-        j = int(np.argmax(d))
-        picked.append(j)
-        d = np.minimum(d, np.linalg.norm(L - L[j], axis=1))
-    sep = min(np.min(np.linalg.norm(L[picked] - L[picked][i], axis=1)[
-        np.arange(len(picked)) != i]) for i in range(len(picked)))
-    print(f"palette: {n} colours from {len(pool)} candidates, "
-          f"smallest pairwise CIELAB distance {sep:.1f}")
-    return np.hstack([pool[picked], np.ones((n, 1))])
 
 
 cmap = dict(zip(people, distinct_colors(len(people))))

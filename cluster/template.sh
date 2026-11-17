@@ -1,28 +1,24 @@
 #!/bin/bash
 #SBATCH -J EXPNAME
-#SBATCH -n 1                     # one core: the work is a single-threaded statsmodels fit loop
+#SBATCH -n 1                     # single-threaded statsmodels fit loop
 #SBATCH -N 1
-#SBATCH -t 0-12:00               # 100 rounds: refits slow as the labelled set grows
-#SBATCH -p shared                # NOT `test` -- that partition caps at ~1 h and is for debugging
-#SBATCH --mem=16000              # 748 MB of CSV read per job, then ~11k x 124 float64 in memory
+#SBATCH -t 0-12:00
+#SBATCH -p shared                # not `test`: that partition caps at ~1 h
+#SBATCH --mem=16000
 #SBATCH -o EXPDIR/out_%j.txt
 #SBATCH -e EXPDIR/err_%j.txt
 
-# Keep the numeric libraries single-threaded. Each job asks for one core, and BLAS otherwise
-# spawns a thread per visible CPU -- oversubscribing the node and slowing every job down.
+# one core per job; BLAS would otherwise spawn a thread per visible CPU
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-# The ExtraSensory CSVs are not in the repo. Point this at them on the cluster filesystem;
-# load_data.py falls back to a sibling-repo path that will not exist there.
+# The ExtraSensory CSVs are not in the repo; point this at them on the cluster.
 # export ES_DATA_DIR=/n/holyscratch01/.../ExtraSensory
 
-# Results tree. Leave unset to write under the repo; set it to move the whole tree onto scratch.
+# Unset writes under the repo; set it to move the results tree onto scratch.
 # export AL_RESULTS_DIR=/n/holyscratch01/.../Active_Learning_results
 
-# Quoted: a repo path containing spaces would otherwise be split into separate arguments.
-# NOTE the #SBATCH -o/-e lines above CANNOT be quoted -- SLURM parses those itself and does not
-# honour shell quoting -- so a path with spaces in it breaks the log files regardless. Check out
-# the repo somewhere space-free on the cluster; submit_batch.py warns if it is not.
+# Quoted for paths with spaces -- but #SBATCH -o/-e above cannot be, so check the repo out
+# somewhere space-free on the cluster. submit_batch.py warns if it is not.
 "PYTHONBIN" -u "RUNPY" "EXPDIR" EXPNAME KWARGS

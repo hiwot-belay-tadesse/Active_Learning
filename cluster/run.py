@@ -1,23 +1,9 @@
 """What each cluster job runs, and the queue of jobs to submit.
 
-Adapted from odyssey-tools/automatic-submission. Two roles in one file, as in the original:
-``submit_batch.py`` imports ``QUEUE``/``DRYRUN``/``LOG_DIR`` from here to decide what to submit,
-and each SLURM job re-enters through ``main()`` to do the work.
+submit_batch.py imports QUEUE/DRYRUN/LOG_DIR from here; each SLURM job re-enters through main().
+The unit of parallelism is one split, so jobs never touch the same file and need no merge step.
 
-The unit of parallelism is ONE SPLIT. ``main.py --first_split k --splits 1`` runs exactly split
-k and writes ``per_round_split<k>.csv`` + ``queries_split<k>.csv``; different k never touch the
-same file, so jobs need no locking and no merge step. All jobs of one queue entry land in the
-same run folder, because ``paths.run_dir()`` derives it from the configuration rather than from
-anything job-specific.
-
-    python cluster/submit_batch.py            # from the REPO ROOT, not from cluster/
-
-
-Editing the queue
------------------
-Each entry is ``(name, dict-of-lists)`` and expands to one job per combination of the lists, so
-``dict(split=range(20), methods=["eer random"])`` is 20 jobs. ``name`` only labels the job and
-its log directory; it does not decide where results go.
+    python cluster/submit_batch.py            # from the REPO ROOT
 """
 import json
 import os
@@ -27,54 +13,30 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
-# False submits to SLURM. True runs the queue one entry after another in the current shell --
-# the local path, and the reason this file replaces typing `python main.py ...` by hand. To run
-# a single acquisition locally, set this True and comment out the QUEUE entries you do not want.
+# True runs the queue in this shell instead of submitting
 DRYRUN = False
 
-# SLURM stdout/stderr only. Results go wherever paths.run_dir() puts them (results/<target>/...),
-# so this directory holds logs and nothing else.
+# SLURM stdout/stderr only; results go where paths.run_dir() puts them
 LOG_DIR = os.path.join(REPO, "cluster", "logs")
 
-# The interpreter the job uses. The repo's own .venv by default, because skactiveml needs
-# sklearn >= 1.6 and the shared `Ban` env has an older stack; override on the cluster with
-# AL_PYTHON=$(which python) after `micromamba activate`.
+# .venv by default (skactiveml needs sklearn >= 1.6); on the cluster set
+# AL_PYTHON=$(which python) after activating the env
 PYTHON = os.environ.get("AL_PYTHON") or os.path.join(REPO, ".venv", "bin", "python")
 
 N_SPLITS = 20
 
-# Every acquisition run so far, each paired with `random` in the same job. The pairing is not
-# cosmetic: both methods share one seed set per target, so the gap is computed within a job and
-# a method is never compared against a random baseline drawn on a different split.
-#
-# coreset and probcover share an entry because that is how they were run at 3 splits, and the
-# existing results are reused by folder name -- splitting them now would make two new folders
-# and forfeit the finished splits. The rest keep their existing pairings for the same reason.
-#
-# Cost per split, measured on 43 targets x 10 rounds (so 20 splits is ~20x this, in parallel):
-#   eer      ~4300 s   (refits 2x per candidate; the only one that needs a long walltime)
-#   laplace   ~166 s
-#   typiclust / coreset / probcover: seconds -- geometry only, no model fits
-# Entry names match the series labels on the per-person grid, so a job name, a log directory and
-# a curve on the plot are all called the same thing. `eu` is the acquisition the plot labels EU;
-# the METHOD flag is still `laplace`, because that string is written into the finished CSVs and
-# the run folder name and renaming it there would orphan them.
+# Entry names match the grid's series labels. `eu` runs METHOD=laplace: that string is in the
+# finished CSVs and folder names, so renaming it would orphan them.
+# Cost per split (43 targets x 10 rounds): eer ~4300 s, laplace ~166 s, the geometry-only
+# methods seconds.
 QUEUE = [
     # ("smoke", dict(split=[0], methods=["random"],
     #             rounds=[1], max_targets=[3], tag=["smoke"])),
-    # `refs=1` only here: the 100%-label reference models depend on the split and the priors,
-    # not on the acquisition, so one entry computes them for everyone. They land in THIS run's
-    # analysis/ and the grid reads them from there with `--refs`.
+    # refs=1 only here: references are acquisition-independent, so one entry covers everyone
     ("random",    dict(split=list(range(N_SPLITS)), methods=["random"], refs=[1])),
     ("eu",        dict(split=list(range(N_SPLITS)), methods=["laplace"])),
-    # The epistemic-uncertainty ablation: same Laplace posterior, same owner-coded design, but
-    # the candidate is ranked by its OWN variance x~_c' Sigma x~_c instead of by the reduction
-    # it would buy for the target. It is EU with the evaluation set collapsed to {c}, so the
-    # quantity EU puts in its denominator becomes the objective. Owner-coded on purpose: then
-    # `eu` and `laplace_var` differ ONLY in the criterion, which is what makes it a control.
-    # Caveat for reading the result: the variance branch takes a static top-b of one ranking
-    # (laplace_variance.py:296), with no Sherman-Morrison between picks, so a batch of 3 can be
-    # three adjacent blocks of the same participant. EU does not have that failure mode.
+    # laplace_var: ranks a candidate by its own variance, not the reduction it buys. Static
+    # top-b, no Sherman-Morrison between picks, so a batch can be adjacent blocks of one person.
     # ("laplace_var", dict(split=list(range(N_SPLITS)), methods=["laplace_var"])),
     # ("eer",       dict(split=list(range(N_SPLITS)), methods=["eer"])),
     ("typiclust", dict(split=list(range(N_SPLITS)), methods=["typiclust"])),
@@ -82,29 +44,13 @@ QUEUE = [
     ("probcover", dict(split=list(range(N_SPLITS)), methods=["probcover"])),
 ]
 
-# Random is its own entry rather than riding along in every job. That is safe because the seed
-# set is drawn from default_rng([seed, split_id, participant, 11]) (main.py) and does NOT depend
-# on the method list, so random computed alone gets byte-identical seed sets and the gap stays a
-# paired comparison. Two consequences:
-#
-#   * run_dir() derives the folder from the method list, so these are NEW folders -- e.g.
-#     computer_work_w15_laplace_r10x3_s5, not ..._laplace-random_... . The finished 3-split runs
-#     are not resumed into and stay on disk untouched; the array recomputes all 20 splits.
-#   * main.py's per-split summary line prints a gap only when `random` is in the same job, so
-#     these jobs print the run folder and nothing else. Read the gaps off the grid instead,
-#     passing the random run through --also:
-#         python plots/per_person_grid.py --run <eu run> \
-#             --also <random run> <eer run> <typiclust run> <coreset run> <probcover run>
+# Random is its own entry: the seed set does not depend on the method list, so the gap is still
+# paired. Each method therefore gets its own run folder, and a job prints no gap -- read those
+# off the grid, passing the other runs through --also.
 
-# Settings shared by every job. These must match across the queue entries you intend to compare,
-# because the grid overlays curves from different runs on the assumption that split k means the
-# same split everywhere -- which holds only if block/n_seed/seed/rounds/batch agree.
-# seed_source="cohort" puts n_seed_per_person labels from EVERY participant in the starting
-# set (2 x 43 = 86 here, of which 2 are the target's own), so every arm begins from the same
-# population model instead of from the target's own n_seed labels. n_seed/n_seed_pos are then
-# unused -- initial_labels() reads them only under seed_source="self" -- but are left in place
-# so switching back needs no edit. The seeding is part of the run folder name, so cohort and
-# self runs cannot overwrite each other.
+# Shared settings. These must agree across entries you intend to compare on one grid.
+# seed_source="cohort" seeds from every participant; n_seed/n_seed_pos are then unused but kept
+# so switching back needs no edit.
 COMMON = dict(target="computer_work", block=15, rounds=10, batch=3,
               seed_source="cohort", n_seed_per_person=2,
               n_seed=3, n_seed_pos=1, n_slopes=5, seed=0)
@@ -117,16 +63,9 @@ def command(exp_kwargs):
     argv = [PYTHON, os.path.join(REPO, "main.py"),
             "--first_split", str(exp_kwargs["split"]), "--splits", "1",
             "--methods", *str(exp_kwargs["methods"]).split(),
-            # --resume makes re-submission idempotent: a job whose split is already written
-            # exits without redoing it, so a partially failed array can simply be resubmitted.
-            "--resume",
-            # --no_index keeps 20 concurrent jobs off results/index.csv, which is a
-            # read-modify-write of a single file. Rebuild it once afterwards with
-            #     python paths.py --reindex
-            "--no_index"]
-    # main.py declares these with action="store_true", so they take NO value: emitting
-    # `--refs 1` makes argparse fail with "unrecognized arguments: 1". A falsy value omits
-    # the flag entirely rather than passing --refs 0, which would also switch it on.
+            "--resume",          # re-submission is idempotent
+            "--no_index"]        # concurrent jobs would race on index.csv; `paths.py --reindex` after
+    # store_true flags: emit the bare flag, or nothing at all
     FLAGS = {"refs", "resume", "no_index", "reserve"}
     for k, v in kw.items():
         if k == "split":

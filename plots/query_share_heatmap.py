@@ -31,7 +31,8 @@ import pandas as pd                                                      # noqa:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from load_data import get_target, load                                   # noqa: E402
-from paths import RESULTS_ROOT, analysis_path, figure_path               # noqa: E402
+from paths import (RESULTS_ROOT, analysis_path, figure_path, run_folders,
+                   run_glob)               # noqa: E402
 from preprocess_data import canonical_ids, prepare_one                   # noqa: E402
 
 ORDER = ["laplace", "eer", "typiclust", "coreset", "probcover", "random"]
@@ -148,7 +149,7 @@ def main():
     a = ap.parse_args()
 
     root = os.path.join(RESULTS_ROOT, a.target)
-    files = sorted(glob.glob(os.path.join(root, f"*{a.contains}*", "queries_split*.csv")))
+    files = run_glob(a.target, f"*{a.contains}*", "queries_split*.csv")
     if not files:
         raise SystemExit(f"no queries_split*.csv under {root}/*{a.contains}*")
     Q = pd.concat([pd.read_csv(f).assign(_src=f) for f in files], ignore_index=True)
@@ -245,7 +246,7 @@ def main():
         return src, [t for t in src if t in targets] + \
                     [t for t in targets if t not in src]
 
-    run = a.run or sorted(glob.glob(os.path.join(root, f"*laplace*{a.contains}*")))[0]
+    run = a.run or run_folders(a.target, f"*laplace*{a.contains}*")[0]
 
     tbl = {"pool_share": P}
     for m in ms:

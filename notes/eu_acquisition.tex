@@ -1,0 +1,551 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, bm}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\bb}{\bm{\beta}}
+\newcommand{\bu}{\bm{\gamma}}
+\newcommand{\bt}{\bm{\theta}}
+\newcommand{\bx}{\bm{x}}
+\newcommand{\bz}{\bm{z}}
+\newcommand{\bS}{\bm{\Sigma}}
+\newcommand{\bL}{\bm{\Lambda}}
+\newcommand{\bM}{\bm{M}}
+\newcommand{\bW}{\bm{W}}
+\newcommand{\bX}{\bm{X}}
+\newcommand{\bZ}{\bm{Z}}
+\newcommand{\bI}{\bm{I}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+\title{Two Acquisitions from One Laplace Posterior\\[2pt]
+\large EU (variance reduction) and ranking by own variance}
+\author{Class note}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{What this note is about}
+
+We want good predictions for \emph{one} person, and we may buy a label for any row in a pool
+that many people contributed. The model is a logistic mixed-effects model, so after fitting we
+have not just a point estimate but a posterior: a description of what the model still does
+\emph{not} know, and in which directions of parameter space. Buying a label shrinks that
+ignorance, but only along the direction the labelled row points in.
+
+That leaves two different questions one could ask of the same posterior, and the note is about
+the difference between them.
+\begin{itemize}
+  \item \textbf{Where am I most ignorant?} Score a candidate by its own posterior variance,
+        $\tilde{\bx}_c^{\!\top}\bS\tilde{\bx}_c$, and buy the maximum. This is epistemic
+        uncertainty sampling in its plainest form.
+  \item \textbf{Which purchase shrinks my ignorance where it will be measured?} Score a
+        candidate by how much labelling it reduces the predictive variance summed over the
+        \emph{target's} rows. This is \textbf{EU} --- the criterion the experiments run and the
+        figures label EU.
+\end{itemize}
+The first is a property of the candidate alone; the second is a property of the pair
+(candidate, target). \S\ref{sec:crit} derives EU, \S\ref{sec:var} the own-variance rule, and
+\S\ref{sec:cmp} puts them side by side: they are not two families of criterion but the same
+formula with two different answers to ``variance \emph{where}?''. As a by-product, \S\ref{sec:prov}
+shows why EU ends up buying mostly the target's own data without ever being told to --- and why
+the own-variance rule should do the opposite.
+
+\section{Setting}
+
+We have $P$ participants. Participant $p$ contributes rows $(\bx_{pi}, y_{pi})$ with
+$\bx_{pi}\in\mathbb{R}^{d}$ standardised features and $y_{pi}\in\{0,1\}$. All participants'
+training rows form one \emph{pool}. For a chosen \emph{target} participant $t$ we must build a
+model that predicts $y$ on $t$'s held-out rows, and we may buy labels from \emph{anyone} in the
+pool. The acquisition function answers: given a budget of one label, which pool row should we
+buy?
+
+\paragraph{Model.} A logistic mixed-effects model with a random intercept per participant and
+random slopes on a chosen subset $S\subset\{1,\dots,d\}$ of features,
+\begin{equation}
+  \Pr(y_{pi}=1) = \sigma(\eta_{pi}), \qquad
+  \eta_{pi} = \bx_{pi}^{\!\top}\bb \;+\; u_{p} \;+\; \sum_{k\in S} v_{pk}\,x_{pi,k},
+  \label{eq:model}
+\end{equation}
+with $\sigma(z)=(1+e^{-z})^{-1}$, fixed effects $\bb$, and random effects
+$u_p \sim \mathcal{N}(0,s_0^2)$, $v_{pk}\sim\mathcal{N}(0,s_k^2)$.
+
+Read \eqref{eq:model} as three sources of signal: $\bb$ is what the feature means
+\emph{for everybody}, $u_p$ is how much more or less participant $p$ does the activity than
+average, and $v_{pk}$ is how much more or less \emph{strongly} feature $k$ predicts it for them.
+The personalisation lives entirely in $(u_p, \bm{v}_p)$, and those parameters can only ever be
+estimated from $p$'s own rows --- a fact that will come back in \S\ref{sec:prov}.
+
+\paragraph{Stacking.} It is convenient to write \eqref{eq:model} as one linear predictor. Let
+$\bu$ collect \emph{all} random effects (every participant's intercept and slopes), and for a row
+define the augmented design vector
+\begin{equation}
+  \tilde{\bx}_{pi} = \begin{bmatrix} \bx_{pi} \\ \bz_{pi} \end{bmatrix},
+  \qquad
+  \bt = \begin{bmatrix} \bb \\ \bu \end{bmatrix},
+  \qquad
+  \eta_{pi} = \tilde{\bx}_{pi}^{\!\top}\bt ,
+  \label{eq:stack}
+\end{equation}
+where $\bz_{pi}$ is \emph{zero everywhere except in the block of coordinates belonging to
+participant $p$}, in which it holds $1$ (multiplying the intercept $u_p$) and $x_{pi,k}$ for
+$k\in S$ (multiplying the slopes $v_{pk}$):
+\begin{equation}
+  \bz_{pi} = \big(\underbrace{0,\dots,0}_{\text{participant }1},\;\dots,\;
+                  \underbrace{1,\; x_{pi,k_1},\dots,x_{pi,k_{|S|}}}_{\text{participant }p},\;
+                  \dots,\;\underbrace{0,\dots,0}_{\text{participant }P}\big)^{\!\top}.
+  \label{eq:zdef}
+\end{equation}
+\paragraph*{Notation.} The scalar $u_p$ is \emph{one} participant's intercept and $v_{pk}$ one
+of their slopes, as in \eqref{eq:model}; the vector $\bu$ is the whole stack --- every
+participant's intercept and every slope, $P(1+|S|)$ numbers in all --- so $\bt=(\bb,\bu)$ is
+every parameter the model has. The intercept is a random effect, inside $\bu$; the
+\emph{population} intercept stays in $\bb$, which is why the variance component is specified as
+\texttt{"0 + C(person)"} in \texttt{utility.py} --- one coefficient per participant and no
+shared intercept duplicated between the two.
+
+So a row carries the population features in the open and its owner's identity as the position of
+its non-zero block. Two rows can interact through $\bu$ only if they sit in the same block, i.e.\
+only if the same person recorded them. That single sparsity fact is the whole story of
+\S\ref{sec:prov}.
+
+\section{Laplace approximation to the posterior}
+
+Priors: $\bb \sim \mathcal{N}(0, \sigma_{\mathrm{fe}}^2 \bI)$ and $u_p,v_{pk}$ as above. Writing
+$\bL = \mathrm{blockdiag}\!\left(\sigma_{\mathrm{fe}}^{-2}\bI,\; \mathrm{diag}(s^{-2})\right)$,
+the log posterior is
+\begin{equation}
+  \ell(\bt) = \sum_{p,i}\Big[ y_{pi}\eta_{pi} - \log\big(1+e^{\eta_{pi}}\big)\Big]
+              - \tfrac12 \bt^{\!\top}\bL\,\bt + \text{const}.
+  \label{eq:post}
+\end{equation}
+\texttt{statsmodels}' \texttt{BinomialBayesMixedGLM.fit\_map()} returns the mode
+$\hat{\bt} = \argmax_{\bt} \ell(\bt)$. The Hessian of the negative log posterior at the mode is
+\begin{equation}
+  \bS^{-1} \;=\; -\nabla^2 \ell(\hat\bt) \;=\; \tilde{\bX}^{\!\top} \bW \tilde{\bX} + \bL,
+  \qquad
+  \bW = \mathrm{diag}\big(\mu_{pi}(1-\mu_{pi})\big),\quad \mu_{pi}=\sigma(\hat\eta_{pi}),
+  \label{eq:sigma}
+\end{equation}
+where $\tilde{\bX}$ stacks the $\tilde{\bx}_{pi}$ of the \emph{currently labelled} rows. The
+Laplace approximation is $p(\bt \mid \mathcal{D}) \approx \mathcal{N}(\hat\bt, \bS)$.
+
+\paragraph{How to read $\bS^{-1}$.} Equation~\eqref{eq:sigma} is an \emph{information} matrix,
+and it is a sum of one rank-one term per labelled row plus the prior. Each labelled row
+contributes $w\,\tilde{\bx}\tilde{\bx}^{\!\top}$: it stiffens the posterior along its own
+direction $\tilde{\bx}$ and does nothing at all in directions orthogonal to it. Inverting,
+$\bS$ is small in directions that many labels have pointed along and large in directions nothing
+has yet probed. ``What the model does not know'' is therefore not one number but an ellipsoid,
+and labelling is the act of flattening it along one chosen axis. The weight
+$w = \mu(1-\mu)$ says a row stiffens things most when the model sits near $\mu=\tfrac12$ on it,
+and almost not at all when the model is already confident ($\mu\!\to\!0$ or $1$): a predictable
+outcome carries little information about the parameters.
+
+\paragraph{Two kinds of uncertainty.} For a row $\tilde{\bx}$ the linear predictor has
+approximate posterior variance
+\begin{equation}
+  \Var[\eta] \;\approx\; \tilde{\bx}^{\!\top}\bS\,\tilde{\bx} .
+  \label{eq:epi}
+\end{equation}
+This is the \textbf{epistemic} (reducible) uncertainty --- ignorance about the parameters, read
+out in the direction of this row. It shrinks as labels arrive, because \eqref{eq:sigma}
+accumulates one term per labelled row. It is distinct from the \textbf{aleatoric} part
+$\mu(1-\mu)$, the irreducible Bernoulli noise: a fair coin has maximal $\mu(1-\mu)$ and zero
+epistemic uncertainty, and no amount of labelling will change that. Classical uncertainty
+sampling ranks by $\mu(1-\mu)$ and therefore chases the decision boundary, where the answer is
+genuinely a coin flip; here we rank by \eqref{eq:epi} and chase \emph{ignorance}.
+
+\section{EU: the variance-reduction criterion}
+\label{sec:crit}
+
+Let $E = \{\tilde{\bx}_e\}$ be an evaluation set --- the target's rows, where we want good
+predictions --- and let $c$ be a candidate pool row we might label. Labelling $c$ adds one term
+to \eqref{eq:sigma}:
+\begin{equation}
+  \bS_c^{-1} \;=\; \bS^{-1} + w_c\,\tilde{\bx}_c\tilde{\bx}_c^{\!\top},
+  \qquad w_c = \mu_c(1-\mu_c).
+  \label{eq:rank1}
+\end{equation}
+This is a rank-one update, so the Sherman--Morrison identity applies:
+\begin{equation}
+  \bS_c \;=\; \bS \;-\; \frac{w_c\, \bS \tilde{\bx}_c \tilde{\bx}_c^{\!\top} \bS}
+                             {1 + w_c\, \tilde{\bx}_c^{\!\top}\bS\tilde{\bx}_c}.
+  \label{eq:sm}
+\end{equation}
+Summing \eqref{eq:epi} over the evaluation set before and after, and substituting \eqref{eq:sm},
+the \emph{total variance reduction} is
+\begin{equation}
+  \boxed{\;
+  \Delta(c) \;=\; \sum_{e\in E}\Big(\tilde{\bx}_e^{\!\top}\bS\tilde{\bx}_e
+                                   - \tilde{\bx}_e^{\!\top}\bS_c\tilde{\bx}_e\Big)
+            \;=\; \frac{w_c \displaystyle\sum_{e\in E}
+                        \big(\tilde{\bx}_e^{\!\top}\bS\,\tilde{\bx}_c\big)^{2}}
+                       {1 + w_c\,\tilde{\bx}_c^{\!\top}\bS\,\tilde{\bx}_c} \; }
+  \label{eq:crit}
+\end{equation}
+and the strategy queries $c^\star = \argmax_{c} \Delta(c)$. This is \emph{A-optimality} on the
+linear predictor, restricted to the evaluation set.
+
+\subsection{How to read the criterion}
+
+Three factors, each with a plain meaning.
+
+\begin{description}
+  \item[Numerator: coupling, not similarity.] The quantity
+        $\tilde{\bx}_e^{\!\top}\bS\,\tilde{\bx}_c$ is an inner product \emph{in the metric of
+        the current ignorance}. It is large when the candidate and a target row point along a
+        direction the model has not yet pinned down, and it is near zero either when they point
+        in unrelated directions or when the direction they share is already well determined.
+        So a candidate is not rewarded for looking like the target's data; it is rewarded for
+        looking like the target's data \emph{in the part of parameter space still in doubt}. The
+        square makes the sign irrelevant --- learning that a direction pushes down is as useful
+        as learning that it pushes up --- and the sum over $E$ makes this ``how much of the
+        target's data does it reach''.
+  \item[$w_c$: is the label still worth buying?] $w_c = \mu_c(1-\mu_c)$ is the aleatoric weight
+        from \eqref{eq:sigma}. If the model already predicts $c$ with near-certainty, the
+        realised label will mostly confirm what is known, and $w_c \to 0$ switches the candidate
+        off. Note the contrast with uncertainty sampling, which maximises exactly this factor;
+        here it is a modulator, not the objective.
+  \item[Denominator: diminishing returns.] $1 + w_c\,\tilde{\bx}_c^{\!\top}\bS\tilde{\bx}_c$
+        grows with the candidate's own epistemic variance. A row in a wholly unexplored direction
+        has a big numerator but also a big denominator, which caps how much credit it gets for
+        its own novelty. Without it, the rule would be dominated by outliers; with it,
+        $\Delta(c)$ saturates and the rule prefers rows that are novel \emph{and} relevant over
+        rows that are merely strange.
+\end{description}
+
+\paragraph{A more compact form.} Let $\bM = \sum_{e\in E}\tilde{\bx}_e\tilde{\bx}_e^{\!\top}$ be
+the target's scatter matrix --- a summary of the directions the target's data occupies. Then
+\eqref{eq:crit} is
+\begin{equation}
+  \Delta(c) \;=\; \frac{w_c\;\tilde{\bx}_c^{\!\top}\,\bS\bM\bS\,\tilde{\bx}_c}
+                       {1 + w_c\,\tilde{\bx}_c^{\!\top}\bS\,\tilde{\bx}_c},
+  \label{eq:scatter}
+\end{equation}
+which is the sentence from the opening paragraph verbatim: push the candidate through the current
+ignorance ($\bS\tilde{\bx}_c$), ask how much of the result lands in the subspace the target's
+rows live in ($\bM$), and normalise by the candidate's own novelty. It is also how to implement
+it: $\bS\bM\bS$ is formed once per round, after which each candidate costs one quadratic form.
+
+\paragraph{A one-parameter sanity check.} Take $d=1$ with no random effects, posterior variance
+$s^2$, and scalar rows. Then \eqref{eq:crit} becomes
+\begin{equation}
+  \Delta(c) \;=\; \frac{w_c\,s^4\,x_c^2 \sum_e x_e^2}{1 + w_c\,s^2\,x_c^2},
+  \label{eq:scalar}
+\end{equation}
+increasing in $|x_c|$ but saturating at $s^2\sum_e x_e^2$ --- i.e.\ at best one label removes all
+the variance it is possible to remove in that single direction. It also scales with $s^4$: when
+the model is already confident there is nothing to buy, which is why $\Delta$ decays over rounds
+and the strategy naturally slows down.
+
+\paragraph{Why this is cheap.} Note what \eqref{eq:crit} does \emph{not} contain: $y_c$. The
+weight $w_c$ uses only the current fitted $\mu_c$. Consequently there is no expectation over the
+two possible labels and no refit per candidate --- one $\bS$ per round, then matrix products.
+Contrast expected error reduction, which must simulate both labels and refit for every candidate,
+and is in practice restricted to a random subsample of the pool.
+
+\subsection{How $\Delta(c)$ is actually computed}
+\label{sec:compute}
+
+Everything in \eqref{eq:crit} is a product of three objects that are built once per round. Write
+$\tilde{\bX}_E\in\mathbb{R}^{|E|\times d}$ for the stacked evaluation rows and
+$\tilde{\bX}_C\in\mathbb{R}^{n\times d}$ for the stacked candidates.
+
+\begin{enumerate}
+  \item\textbf{The posterior covariance $\bS$.} Fit the model on the rows labelled so far, then
+        form the information matrix \eqref{eq:sigma} and invert it:
+        \[
+          \bS \;=\; \big(\tilde{\bX}^{\!\top}\bW\tilde{\bX} + \bL\big)^{-1},
+          \qquad \bW = \mathrm{diag}\{\mu_i(1-\mu_i)\},
+        \]
+        where $\tilde{\bX}$ holds the \emph{labelled} rows only and $\bL$ is the diagonal prior
+        precision: $1/\sigma_\beta^2$ on each fixed coefficient and $1/s_{\text{comp}}^2$ on
+        each random-effect column, with the $s$ read off the fitted variance components. Note
+        that $\bL$ is diagonal --- participants are independent \emph{a priori} --- but $\bS$ is
+        dense: inverting couples every coefficient to every other.
+  \item\textbf{The design rows.} Each $\tilde{\bx}$ is the concatenation
+        $[\,1,\ \bx^{\!\top},\ \bz^{\!\top}\,]$ of \eqref{eq:zdef}: the fixed block, then the
+        random block, which is zero everywhere except in the columns belonging to the row's
+        \emph{owner}. This is the only place provenance enters, and it is what
+        Section~\ref{sec:prov} is about.
+  \item\textbf{The weights.} $w_c = \mu_c(1-\mu_c)$ from the \emph{current} fitted probability
+        at $c$. No label is simulated; this is the whole reason the criterion is cheap.
+  \item\textbf{The two quadratic forms.} Compute the $d\times n$ product
+        $\bS\tilde{\bX}_C^{\!\top}$ once, then read both quantities off it column by column:
+        \[
+          q_c \;=\; \tilde{\bx}_c^{\!\top}\bS\tilde{\bx}_c
+          \quad\text{(the candidate's own epistemic variance)},
+          \qquad
+          \mathrm{cx}_c \;=\; \big\|\tilde{\bX}_E\,\bS\tilde{\bx}_c\big\|^2
+          \;=\;\sum_{e\in E}\big(\tilde{\bx}_e^{\!\top}\bS\tilde{\bx}_c\big)^2 .
+        \]
+  \item\textbf{The criterion.} $\Delta(c) = w_c\,\mathrm{cx}_c/(1 + w_c q_c)$, evaluated for
+        every candidate at once, and $c^\star=\argmax_c\Delta(c)$.
+\end{enumerate}
+
+\paragraph{A batch of $b$, not $b$ copies of the best.} The utilities above are valid for
+\emph{one} purchase. Taking the top $b$ of a single ranking would buy $b$ near-duplicates,
+because two rows that are close in the metric of $\bS$ have nearly equal $\Delta$. The loop
+therefore re-applies \eqref{eq:sm} after each pick: having chosen $c^\star$, set
+\[
+  \bS \;\leftarrow\; \bS - \frac{w_{c^\star}\,(\bS\tilde{\bx}_{c^\star})(\bS\tilde{\bx}_{c^\star})^{\!\top}}
+                               {1 + w_{c^\star}\,q_{c^\star}},
+\]
+recompute $q$ and $\mathrm{cx}$ against the updated $\bS$, and pick again. The update is the
+same Sherman--Morrison step the criterion was derived from, so the second pick is scored against
+a posterior that already believes the first label has arrived --- without that label's value
+ever being used. The evaluation set is unchanged within a batch; it shrinks between rounds as
+the target's rows get labelled.
+
+\paragraph{Cost.} Per round: one model fit, one $d\times d$ inverse, and one $d\times n$
+product, i.e.\ $O(d^3 + d^2 n)$, then $O(d|E|)$ per candidate for $\mathrm{cx}$. The $b$
+re-rankings inside a batch are rank-one updates, not refits. In this study $d\approx 200$ and
+$n\approx 10^4$, which is a few seconds per round --- against expected error reduction, which
+refits twice per candidate and must be subsampled to run at all.
+
+\paragraph{What the three factors contribute in practice.} Written as a ratio of self to
+stranger candidates at round~1, the factors do not pull together. The numerator
+$\mathrm{cx}_c$ favours the target's own rows, because they lie along the directions its own
+evaluation rows span. The denominator favours them more strongly, and for a reason worth
+stating plainly: $q_c$ is \emph{smaller} for the target's rows, since the seed labels are the
+target's own and have already pinned that part of the design space. Novelty is a cost here, so
+the least novel participant is the cheapest to buy from. The weight $w_c$ is the one factor
+that pushes the other way, being slightly smaller where the model is already confident. The
+self-preference reported in Section~\ref{sec:prov} is therefore a statement about geometry ---
+alignment with, and proximity to, what is already known about the target --- and not, at this
+sample size, about the random-effect blocks, whose contribution to
+$\sum_e\Var[\eta_e]$ is negligible while the variance components are still shrunk toward zero.
+
+\section{The alternative: ranking by own variance}
+\label{sec:var}
+
+The same class implements a second criterion, selected by \texttt{criterion="variance"}
+(\texttt{main.py --methods laplace\_var}; the queue entry \texttt{eu} is
+\texttt{criterion="reduction"}). It scores a candidate by its \emph{own}
+epistemic variance --- \eqref{eq:epi} evaluated at the candidate rather than at the target:
+\begin{equation}
+  u(c) \;=\; \tilde{\bx}_c^{\!\top}\bS\,\tilde{\bx}_c .
+  \label{eq:var}
+\end{equation}
+One \texttt{einsum} over the pool, and that is the whole computation: no evaluation set, no
+weight $w_c$, no Sherman--Morrison. It is the naive reading of ``most uncertain under the
+posterior'' --- \emph{where am I most ignorant?} --- as against \eqref{eq:crit}'s \emph{which
+purchase shrinks my ignorance where it will be measured?}
+
+\paragraph{It is the $E=\{c\}$ special case.} Collapse the evaluation set onto the candidate
+itself. Writing $q_c = \tilde{\bx}_c^{\!\top}\bS\tilde{\bx}_c$, \eqref{eq:crit} becomes
+\begin{equation}
+  \Delta(c)\Big|_{E=\{c\}} \;=\; \frac{w_c\,q_c^{2}}{1 + w_c\,q_c},
+  \label{eq:collapse}
+\end{equation}
+which is monotone increasing in $q_c$ and therefore ranks the pool exactly as \eqref{eq:var}
+does. So the ablation is not a different family of criterion: it is \eqref{eq:crit} with the
+evaluation set moved onto the row being bought. It optimises the prediction at the point it
+purchases, not at the points it will be scored on. Note also that $q_c$ is precisely the
+\emph{denominator} of \eqref{eq:crit}: the quantity \eqref{eq:var} maximises is the one the full
+criterion divides by. Novelty is the objective for the ablation and a cost for \eqref{eq:crit}.
+
+\paragraph{What it should do, and why.} Maximising $q_c$ maximises a leverage-like quantity, so
+it buys the most unusual rows available --- extrapolation points in sparse regions of feature
+space, which teach the target's prediction nothing. Two further differences follow from the code
+rather than the algebra:
+\begin{itemize}
+  \item \textbf{No aleatoric gate.} $w_c$ is absent from \eqref{eq:var}, so a candidate the model
+        already predicts with near-certainty is not switched off the way \eqref{eq:crit}
+        switches it off.
+  \item \textbf{No within-batch diversification.} \eqref{eq:crit} re-applies the rank-one update
+        after each pick, so the second pick of a batch is scored against a posterior that
+        already contains the first. \eqref{eq:var} is a single static score, and a batch of $b$
+        is its top $b$ entries --- which can be $b$ near-duplicate rows from the same sparse
+        region.
+\end{itemize}
+Provenance also runs the other way. $q_c$ contains the candidate's own random-effect block, and a
+participant with \emph{few} labels has a large, prior-dominated $\bS_{\bu\bu}$ there, so
+\eqref{eq:var} should prefer thinly-labelled strangers --- a low self-share, roughly the inverse
+of \S\ref{sec:prov}. The pull is toward the thinly labelled rather than the wholly unlabelled,
+because an owner with no labels at all has no random-effect columns in the current fit and is
+ranked on the fixed-effect term alone.
+
+The ablation exists to confirm that the evaluation set in \eqref{eq:crit} is doing the work. It
+is implemented but has not been run: it is absent from \texttt{results/index.csv} and from the
+\texttt{cluster/run.py} queue, so everything in this subsection is what the formulas predict,
+not what the experiments show.
+
+\section{Side by side}
+\label{sec:cmp}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & \textbf{EU} --- $\Delta(c)$, \eqref{eq:crit} & \textbf{own variance} --- $u(c)$, \eqref{eq:var} \\
+\midrule
+scores                & the pair (candidate, target)      & the candidate alone \\
+evaluation set $E$    & the target's own unlabelled blocks & none \\
+aleatoric gate $w_c$  & yes --- a certain row is worthless & no \\
+own novelty $q_c$     & in the denominator: a \emph{cost}  & the \emph{objective} \\
+a batch of $b$        & greedy; $\bS$ updated after each pick & top $b$ of one static score \\
+what it buys          & rows coupled to the target through  & the most unusual rows \\
+                      & directions still in doubt           & in the pool \\
+provenance            & self-preferring ($\approx\!64\%$ own) & thinly-labelled strangers \\
+                      & (\S\ref{sec:prov})                  & (predicted, \S\ref{sec:var}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The row that matters is the second. Both criteria measure variance under the same $\bS$; they
+differ in \emph{where} they measure it. Collapse EU's evaluation set onto the candidate itself
+and the two coincide exactly --- that is \eqref{eq:collapse} --- so the own-variance rule is not a
+rival criterion but the degenerate case of EU in which the only row whose prediction you care
+about is the one you are about to buy. Everything else in the table follows from that single
+substitution: with $E$ pointing at the target, a candidate's own strangeness is something to be
+discounted (it appears in the denominator) and its coupling to the target is the prize; with $E$
+pointing at the candidate, strangeness \emph{is} the prize.
+
+A second difference is worth separating out because it is not algebra. EU is evaluated
+sequentially within a batch --- after each pick $\bS$ is updated by \eqref{eq:sm}, so the next
+pick is scored against a posterior that already contains the last --- while the own-variance rule
+is a single static ranking whose top $b$ entries can be $b$ near-duplicates. At $b=3$ this is a
+real behavioural difference and not a detail of the objective.
+
+\section{Where provenance comes from}
+\label{sec:prov}
+
+Expand the coupling term of \eqref{eq:crit} using the block structure of \eqref{eq:stack}. Write
+$\bS$ in blocks conformable with $(\bb,\bu)$:
+\begin{equation}
+  \tilde{\bx}_e^{\!\top}\bS\,\tilde{\bx}_c
+  = \underbrace{\bx_e^{\!\top}\bS_{\bb\bb}\,\bx_c}_{\text{population channel}}
+  + \underbrace{\bx_e^{\!\top}\bS_{\bb\bu}\,\bz_c
+    + \bz_e^{\!\top}\bS_{\bu\bb}\,\bx_c
+    + \bz_e^{\!\top}\bS_{\bu\bu}\,\bz_c}_{\text{random-effect channel}} .
+  \label{eq:blocks}
+\end{equation}
+Because $\bz$ is non-zero only in its owner's block \eqref{eq:zdef}, the last term vanishes
+unless $c$ and $e$ belong to the \emph{same} participant. Therefore:
+\begin{itemize}
+  \item a \textbf{stranger's} label ($c$ from $p \neq t$) helps the target only through the
+        shared fixed effects $\bb$ --- it can teach the model what a feature means on average,
+        and nothing about the target specifically;
+  \item the \textbf{target's own} label helps through both $\bb$ and $t$'s own random effects
+        $(u_t,\bm{v}_t)$, which are the only parameters that make the model personal and which
+        no one else's data can touch.
+\end{itemize}
+Two channels beat one, so the criterion prefers the target's own rows \emph{without being told
+to}: the preference is a consequence of the model's covariance structure, not a hand-coded bias.
+It also predicts the preference should be strongest early --- when $(u_t,\bm{v}_t)$ are still
+governed by the prior and $\bS_{\bu\bu}$ is large --- and weaken as the target's own block fills
+in. Empirically the effect is large: on ExtraSensory \texttt{computer\_work} the method draws
+$\approx 64\%$ of its purchases from the target itself, against $2.2\%$ for a proportional
+sampler.
+
+\paragraph{Candidate coding is a modelling decision.} The participant code is read from the
+candidate row. With \emph{owner} coding (each row coded to whoever recorded it) the above holds.
+With \emph{target} coding (every candidate coded as the target) every $\bz_c$ equals the
+target's, the random-effect channel is always on, and the provenance term disappears. The
+criterion is still coherent --- ``which feature vector, labelled as if it were mine, most reduces
+my predictive variance'' --- but it answers a different question.
+
+\section{Reducing variance for the whole cohort}
+\label{sec:cohort}
+
+Everything so far takes $E$ to be the target's own unlabelled blocks, so \eqref{eq:crit} asks
+which label most shrinks \emph{the target's} predictive variance. The criterion does not require
+that. $E$ is a free argument, and widening it to the whole cohort turns the same formula into a
+population design. The procedure is unchanged in steps 1, 3 and 4 below; only step 2 differs,
+and it is worth being precise about what it changes.
+
+\begin{enumerate}
+  \item\textbf{Posterior.} Refit on the labelled rows and form $\bS$ as in \eqref{eq:sigma}.
+        Its dimension is $d = k_{\text{fe}} + k_{\text{vc}}$: the fixed block plus one column per
+        (component, participant) pair currently in the fit.
+
+  \item\textbf{Evaluation set.} Replace the target's rows by \emph{every} participant's
+        unlabelled rows, \textbf{each coded to its own owner}. The coding is the substance, not
+        bookkeeping. A design row is $\tilde{\bx} = [\,1,\ \bx^{\!\top},\ \bz^{\!\top}\,]$ with
+        $\bz$ non-zero only in the owner's columns \eqref{eq:zdef}; pooling the rows but coding
+        them all to one participant would shrink the variance of a person who does not exist.
+        With the owner codes in place, $\sum_{e\in E}\Var[\eta_e]$ is the cohort's total
+        predictive uncertainty, and \eqref{eq:crit} is A-optimality against it.
+
+  \item\textbf{Weights.} $w_c = \mu_c(1-\mu_c)$ at the current mode, as before. No label is
+        simulated, so one $\bS$ per round still suffices for the whole pool.
+
+  \item\textbf{Score, pick, downdate.} Evaluate \eqref{eq:scatter}, take the argmax, apply the
+        rank-one downdate \eqref{eq:rank1} to $\bS$, and repeat for the remaining picks in the
+        batch. $\bM$ does not change within a batch; only $\bS$ does.
+\end{enumerate}
+
+\paragraph{Whose uncertainty, in what proportion.} An unweighted sum over all unlabelled rows is
+A-optimality under the \emph{pool's} empirical measure, which weights participants by how much
+data they happened to contribute --- on \texttt{computer\_work} the largest contributes
+$\approx 492$ of $\approx 11\,000$ blocks, others far fewer. If ``everyone'' is meant to mean
+people rather than rows, weight each row by the reciprocal of its owner's block count. Both are
+defensible; they are different objectives, and the scatter matrix makes the choice explicit:
+\begin{equation}
+  \bM \;=\; \sum_{u} \pi_u \, \bM_u,
+  \qquad
+  \bM_u \;=\; \frac{1}{|E_u|}\sum_{e \in E_u} \tilde{\bx}_e \tilde{\bx}_e^{\!\top} ,
+  \label{eq:mmix}
+\end{equation}
+with $\pi$ a distribution over participants. $\pi = \delta_{\text{target}}$ recovers the
+personalised criterion of Section~\ref{sec:compute}; uniform $\pi$ gives the population design;
+anything between is a mixture, at no extra cost, since only $\bM$ changes.
+
+\paragraph{Why the compact form stops being optional.} For the target, $|E| \approx 230$ and the
+row-wise evaluation of \eqref{eq:crit} --- form $\bS\tilde{\bX}_C^{\!\top}$, square
+$\tilde{\bX}_E\bS\tilde{\bX}_C^{\!\top}$, sum down the columns --- costs
+$O(|E|\,d\,n_{\text{cand}})$ and is perfectly comfortable. For the cohort, $|E|$ is the whole
+unlabelled pool, and that same expression grows by a factor of $|E|$. Equation
+\eqref{eq:scatter} removes the dependence entirely: build $\bM$ once at $O(|E| d^2)$, form
+$\bS\bM\bS$ at $O(d^3)$, and each candidate then costs a single quadratic form. With $d = 383$
+on a 43-participant split this is negligible. The implementation in
+\texttt{laplace\_variance.py} currently uses the row-wise form, which is the right choice for
+the target and the wrong one for the pool.
+
+\paragraph{Two things that genuinely change.} First, a participant with no labels yet has no
+random-effect columns in the fit, so their rows carry an all-zero random block and enter the
+objective only through $\bb$: their \emph{personal} uncertainty is not represented at all. Under
+seeding from the target alone this is $42$ of $43$ people at round~1, which makes the cohort
+objective close to meaningless there; under a seed that gives every participant a few labels up
+front, it is nobody, and the population design becomes well posed. Second, the criterion stops
+being personal in the sense of Section~\ref{sec:prov}: it has no reason to prefer the target,
+and will buy whatever pins down $\bb$ and the cheapest random effects. Evaluated on one
+participant's held-out days it should therefore look worse than \eqref{eq:crit} with
+$E = E_{\text{target}}$ --- and that gap, not the absolute level, is what measures how much
+targeting is worth.
+
+\section{Approximations}
+
+\begin{enumerate}
+  \item \textbf{Laplace itself.} The posterior is taken to be Gaussian at the mode. For small
+        label sets the true posterior is skewed, so $\bS$ is a rough ruler early --- exactly when
+        the criterion is making its most consequential picks.
+  \item \textbf{Conditional, not marginal.} $\bS$ is the posterior of $(\bb,\bu)$ at the fitted
+        variance components; uncertainty in $s$ itself is dropped. The model is therefore
+        over-confident about \emph{how} personal the problem is.
+  \item \textbf{Fixed parameter space.} The random-slope set $S$ is selected once per split from
+        the full training rows, before the loop, so the model specification does not drift
+        between rounds and acquisitions remain comparable.
+  \item \textbf{$\bW$ at the mode.} $w_c$ is evaluated at the current $\hat\bt$; after labelling,
+        the mode moves and $w_c$ with it. The rank-one update \eqref{eq:rank1} is thus exact for
+        the information matrix but only first-order in the fit.
+\end{enumerate}
+
+\section{What it optimises, and what it does not}
+
+Equation~\eqref{eq:crit} shrinks $\Var[\eta]$ on the target's rows. That is a \emph{proxy} for
+ranking quality, not the same thing: AUROC depends on the ordering of $\eta$, not its posterior
+spread. A model can be confidently wrong, and \eqref{eq:crit} will not notice. Two consequences
+observed in practice:
+\begin{itemize}
+  \item Being label-free, the criterion does \textbf{not} preferentially hunt positives. At a
+        positive rate of $\pi \approx 0.16$ this is a real behavioural difference from
+        uncertainty sampling variants that target expected average precision.
+  \item On targets with very low $\pi$, purely geometric acquisitions (e.g.\ TypiClust) can
+        outperform it, consistent with the above.
+\end{itemize}
+
+\end{document}

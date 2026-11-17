@@ -40,8 +40,12 @@ import sys
 import time
 import warnings
 
+import warnings
+
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from load_data import get_target, load                                   # noqa: E402
@@ -86,41 +90,65 @@ def references_for_split(data, cols, split_id, cfg, ids=None):
     slope_idx = select_slopes(sp.Z, sp.y, sp.pid, cfg.get("n_slopes", 5))
     df = frame(sp.Z, sp.y, sp.pid)
 
-    t0 = time.time()
+    # personal_full is the only reference that needs no pooled fit at all, so --only_personal
+    # skips every global and mixed fit and runs in seconds. main() merges what it writes into
+    # whatever reference_auroc.csv already holds, so the slow models are not lost.
+    only_personal = bool(cfg.get("_only_personal"))
     fe_p = cfg.get("fe_p", 1.0)
-    g = fit_global(df, feats)
-    gp = fit_global_prior(df, feats, fe_p, len(df))
-    sk_b0, sk_beta = fit_global_sklearn(df, feats)
-    fe_g, fe_gp = np.asarray(g.params, float), np.asarray(gp.params, float)
-    print(f"  split {split_id}: global GLMs on {len(df)} rows in {time.time() - t0:.0f}s "
-          f"(||beta|| {np.linalg.norm(fe_g[1:]):.1f} unpenalised vs "
-          f"{np.linalg.norm(fe_gp[1:]):.1f} with the fe_p={fe_p} prior, "
-          f"{np.linalg.norm(sk_beta):.1f} sklearn unpenalised)", flush=True)
-
-    if cfg.get("_only_global"):
+    fe_g = fe_gp = sk_b0 = sk_beta = None
+    tr_global = tr_prior = np.nan
+    if only_personal:
         res = vc = None
     else:
         t0 = time.time()
-        res = fit_mixed(df, feats, vc_formulas(slope_idx),
-                        vcp_p=cfg.get("vcp_p", 0.5), fe_p=fe_p)
-        vc = parse_vc(res)
-        print(f"  split {split_id}: mixed model ({len(slope_idx)} slopes) in "
-              f"{time.time() - t0:.0f}s", flush=True)
+        g = fit_global(df, feats)
+        gp = fit_global_prior(df, feats, fe_p, len(df))
+        sk_b0, sk_beta = fit_global_sklearn(df, feats)
+        fe_g, fe_gp = np.asarray(g.params, float), np.asarray(gp.params, float)
+        print(f"  split {split_id}: global GLMs on {len(df)} rows in {time.time() - t0:.0f}s "
+              f"(||beta|| {np.linalg.norm(fe_g[1:]):.1f} unpenalised vs "
+              f"{np.linalg.norm(fe_gp[1:]):.1f} with the fe_p={fe_p} prior, "
+              f"{np.linalg.norm(sk_beta):.1f} sklearn unpenalised)", flush=True)
 
-    # train-side AUROC too: the gap between train and test is the overfitting diagnostic
-    tr_global = scores(sp.y, fe_g[0] + sp.Z @ fe_g[1:])[0]
-    tr_prior = scores(sp.y, fe_gp[0] + sp.Z @ fe_gp[1:])[0]
-    print(f"  split {split_id}: pooled TRAIN auroc {tr_global:.4f} unpenalised, "
-          f"{tr_prior:.4f} with prior", flush=True)
+        if cfg.get("_only_global"):
+            res = vc = None
+        else:
+            t0 = time.time()
+            res = fit_mixed(df, feats, vc_formulas(slope_idx),
+                            vcp_p=cfg.get("vcp_p", 0.5), fe_p=fe_p)
+            vc = parse_vc(res)
+            print(f"  split {split_id}: mixed model ({len(slope_idx)} slopes) in "
+                  f"{time.time() - t0:.0f}s", flush=True)
+
+        # train-side AUROC too: the gap between train and test is the overfitting diagnostic
+        tr_global = scores(sp.y, fe_g[0] + sp.Z @ fe_g[1:])[0]
+        tr_prior = scores(sp.y, fe_gp[0] + sp.Z @ fe_gp[1:])[0]
+        print(f"  split {split_id}: pooled TRAIN auroc {tr_global:.4f} unpenalised, "
+              f"{tr_prior:.4f} with prior", flush=True)
 
     rows = []
     for u in sp.users:
         Zte, yte = sp.test_of(u)
         pid = sp.ids[u]
-        out = {"global_prior": fe_gp[0] + Zte @ fe_gp[1:],
-               "global_sklearn": sk_b0 + Zte @ sk_beta}
-        if cfg.get("_with_unpenalised"):
-            out["global_full"] = fe_g[0] + Zte @ fe_g[1:]
+        out = {}
+        if fe_gp is not None:
+            out["global_prior"] = fe_gp[0] + Zte @ fe_gp[1:]
+            out["global_sklearn"] = sk_b0 + Zte @ sk_beta
+            if cfg.get("_with_unpenalised"):
+                out["global_full"] = fe_g[0] + Zte @ fe_g[1:]
+        # The ceiling for a TARGET-ONLY model: the same sklearn LogisticRegression that
+        # personal_al.py trains, but on 100% of this participant's training rows instead of the
+        # 30-odd it buys. mixed_full is not that ceiling -- it is a different model class with
+        # everybody's data -- so a personal run read against mixed_full is read against a bound
+        # it has no way to reach. A participant with one class among their own rows has no
+        # personal model at all and simply contributes no row here.
+        own = sp.rows_of(u)
+        if len(own) and len(np.unique(sp.y[own])) == 2:
+            pc = LogisticRegression(C=cfg.get("C", 1.0), max_iter=cfg.get("max_iter", 1000))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                pc.fit(sp.Z[own], sp.y[own])
+            out["personal_full"] = pc.decision_function(Zte)
         if res is not None:
             # personalised: population effects + THIS participant's random intercept and slopes
             out["mixed_full"] = logit_fixed(res, Zte) + random_part(vc, pid, Zte, slope_idx)
@@ -144,6 +172,11 @@ def main():
                     help="default: every split the run has")
     ap.add_argument("--only_global", action="store_true",
                     help="skip the slow mixed fit; merge into an existing reference CSV")
+    ap.add_argument("--only_personal", action="store_true",
+                    help="fit ONLY personal_full -- one logistic regression per participant on "
+                         "100%% of their own rows, the ceiling a target-only acquisition is "
+                         "climbing towards. Skips every pooled and mixed fit, so it takes "
+                         "seconds, and merges into whatever reference_auroc.csv already holds.")
     ap.add_argument("--with_unpenalised", action="store_true",
                     help="also fit the unpenalised pooled GLM (global_full), as a diagnostic")
     ap.add_argument("--out", default="reference_auroc.csv",
@@ -167,7 +200,8 @@ def main():
         R.to_csv(out, index=False)
         print(f"merged {len(parts)} file(s), splits {sorted(R.split.unique())} -> {out}")
         m = R.pivot_table(index="target", columns="model", values="auroc")
-        for name in ("mixed_full", "global_prior", "global_full", "global_sklearn"):
+        for name in ("personal_full", "mixed_full", "global_prior", "global_full",
+                     "global_sklearn"):
             if name in m:
                 print(f"  {name:15s} {m[name].mean():.4f}")
         return
@@ -180,6 +214,7 @@ def main():
     print(f"{run}\n  target {cfg['target']}, W={cfg['block']}, splits {splits}", flush=True)
 
     cfg["_only_global"] = a.only_global
+    cfg["_only_personal"] = a.only_personal
     cfg["_with_unpenalised"] = a.with_unpenalised
     data, cols = load(get_target(cfg["target"]), verbose=True)
     rows, ids = [], None
@@ -196,7 +231,8 @@ def main():
 
     m = R.pivot_table(index="target", columns="model", values="auroc")
     print(f"\nmean over {len(splits)} split(s) and {len(m)} targets:")
-    for name, note in (("mixed_full", "personalised, 100% of labels"),
+    for name, note in (("personal_full", "the target's own rows only, 100% of their labels"),
+                       ("mixed_full", "personalised, 100% of labels"),
                        ("global_prior", "pooled, same fe_p prior as the mixed model"),
                        ("global_full", "pooled, unpenalised (statsmodels)"),
                        ("global_sklearn", "pooled, plain sklearn LogisticRegression")):

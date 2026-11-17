@@ -2,6 +2,9 @@
 #
 #   make run METHOD=coreset SPLITS=20     one acquisition locally, no editing of cluster/run.py
 #   make submit                           the whole QUEUE to SLURM
+#   make submit ONLY=eu_split0            one job from the QUEUE, to test the setup
+#   make submit_cohort                    cohort_al.py to SLURM, one array task per split
+#   make dry_cohort                       print that sbatch line, submit nothing
 #   make local                            the whole QUEUE in this shell (DRYRUN path)
 #   make dry                              print what would be submitted, submit nothing
 #   make refs RUN=<folder>                100%-label reference models for a finished run
@@ -31,14 +34,38 @@ NSLOPES ?= 5
 TAG     ?=
 RUN     ?=
 EXTRA   ?=
+# One job instead of the whole queue: ONLY is matched against the job name `dry` prints.
+#   make submit ONLY=eu_split0      one job
+#   make submit ONLY=_split0        one split of every queue entry
+ONLY    ?=
+
+# cohort_al.py -- ONE mixed-effects model for the whole cohort. It is a separate entry point
+# with no target, so cluster/run.py's QUEUE (which expands a grid and calls main.py) cannot
+# carry it; `submit_cohort` sbatches it directly instead. One array task per SPLIT, because a
+# 20-split run does not fit in one allocation: at batch 10 the labelled set reaches ~1086 rows
+# by round 100 and the Laplace refit cost grows with it, so a split is ~4 h and 20 are ~80 h.
+CSPLITS ?= 20
+CROUNDS ?= 100
+CBATCH  ?= 10
+CSEEDPP ?= 2
+CMETHOD ?= laplace_pool coreset typiclust probcover random
+CTIME   ?= 0-12:00
+CPART   ?= shared
+CMEM    ?= 16000
+# Task ids. Override to re-run specific splits (ARRAY=3,7,11) or to cap concurrency (0-19%5).
+ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) - 1 )))
+# The cluster checkout: $(CENV) is activated, $(CDATA) is where the ExtraSensory CSVs live.
+CENV    ?= al
+CDATA   ?= $$HOME/Active_Learning_new/DATA/ExtraSensory
 
 TAGFLAG := $(if $(TAG),--tag $(TAG),)
+ONLYFLAG := $(if $(ONLY),--only $(ONLY),)
 RUNFLAG := $(if $(RUN),--run $(RUN),--contains r$(ROUNDS)x$(BATCH))
 
-.PHONY: help run submit local dry refs sweep grid bar reindex selftest clean-logs
+.PHONY: help run submit submit_cohort dry_cohort local dry refs sweep grid bar reindex selftest clean-logs
 
 help:
-	@sed -n '2,19p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '2,21p' Makefile | sed 's/^# \{0,1\}//'
 
 # -------------------------------------------------------------------- running
 run:
@@ -51,13 +78,39 @@ run:
 # the Makefile does not flip it for you, because which one you want is not something a target
 # name should decide silently.
 submit:
-	$(PY) cluster/submit_batch.py
+	$(PY) cluster/submit_batch.py $(ONLYFLAG)
 
 local:
-	$(PY) cluster/submit_batch.py
+	$(PY) cluster/submit_batch.py $(ONLYFLAG)
 
 dry:
-	$(PY) cluster/submit_batch.py --dry
+	$(PY) cluster/submit_batch.py --dry $(ONLYFLAG)
+
+# Split in two so both targets share one definition and `dry_cohort` can echo the body
+# verbatim: the body deliberately contains no single quotes, so '$(COHORT_WRAP)' is safe to
+# quote in the recipe and to print. BLAS is pinned to one thread (the job holds one core and
+# would otherwise spawn a thread per visible CPU) and --no_index keeps concurrent tasks off
+# results/index.csv -- run `make reindex` once the array has drained.
+COHORT_SB = -J cohort_al --array=$(ARRAY) -n 1 -N 1 -t $(CTIME) -p $(CPART) --mem=$(CMEM) \
+	    -o cluster/logs/cohort/out_%A_%a.txt -e cluster/logs/cohort/err_%A_%a.txt
+COHORT_WRAP = set -e; export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; \
+	export ES_DATA_DIR=$(CDATA); \
+	module load Miniforge3 2>/dev/null || module load Mambaforge 2>/dev/null || true; \
+	source activate $(CENV); \
+	python -u cohort_al.py --target $(TARGET) --methods $(CMETHOD) --rounds $(CROUNDS) \
+	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 \
+	--first_split $$SLURM_ARRAY_TASK_ID --resume --no_index
+
+submit_cohort:
+	@mkdir -p cluster/logs/cohort
+	sbatch $(COHORT_SB) --wrap '$(COHORT_WRAP)'
+
+dry_cohort:
+	@echo 'sbatch $(COHORT_SB) --wrap:'
+	@echo '    $(COHORT_WRAP)'
+	@echo
+	@echo '  -> results/$(TARGET)/full_global/$(TARGET)_cohort_model_$(CSEEDPP)per_r$(CROUNDS)x$(CBATCH)/'
+	@echo '  -> after the array drains: make reindex'
 
 # -------------------------------------------------------------- after a run
 # Jobs run with --no_index to keep concurrent writers off results/index.csv; this rebuilds it

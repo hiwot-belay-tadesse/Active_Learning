@@ -336,7 +336,7 @@ def main():
     if args.seed_source != "self" and args.tag is None:
         args.tag = f"seed_{args.seed_source}"   # a new seeding never lands on a finished run
     out = args.out or run_dir(t.name, args.block, args.methods, args.rounds, args.batch,
-                              args.n_slopes, args.tag, reserve=args.reserve)
+                              args.n_slopes, args.tag, reserve=args.reserve, scope="global")
     os.makedirs(out, exist_ok=True)
     cfg = write_config(out, args)
     seed_desc = (f"{args.n_seed} own seed" if args.seed_source == "self"
