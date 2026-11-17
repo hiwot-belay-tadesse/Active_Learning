@@ -20,10 +20,12 @@
 # nothing in cluster/run.py has to be commented out. Use `submit`/`local` when you want the
 # whole queue, which is what the cluster array runs.
 
-# The local .venv when there is one, else whatever python is active -- so an activated mamba
-# env is used as-is on a cluster checkout, which has no .venv. Nothing here activates anything.
-# `make python` prints the choice; override with PY=... .
-PY      ?= $(shell [ -x ./.venv/bin/python ] && echo ./.venv/bin/python || command -v python)
+# AL_PYTHON wins (export it once on the cluster: `export AL_PYTHON=$$(which python)`), else the
+# local .venv, else whatever python is active. cluster/run.py reads AL_PYTHON the same way.
+# Nothing here activates anything. `make python` prints the choice; override with PY=... .
+PY      ?= $(shell if [ -n "$$AL_PYTHON" ]; then echo "$$AL_PYTHON"; \
+	           elif [ -x ./.venv/bin/python ]; then echo ./.venv/bin/python; \
+	           else command -v python; fi)
 TARGET  ?= computer_work
 BLOCK   ?= 15
 METHOD  ?= laplace random
@@ -55,8 +57,11 @@ CMETHOD ?= laplace_pool coreset typiclust probcover random
 CTIME   ?= 0-12:00
 CPART   ?= shared
 CMEM    ?= 16000
-# Task ids. Override to re-run specific splits (ARRAY=3,7,11) or to cap concurrency (0-19%5).
-ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) - 1 )))
+# One task per (split, method): id = split * NMETH + method index. Each method gets its own
+# run folder, which the grid merges automatically (it globs the sibling folders).
+NMETH   := $(words $(CMETHOD))
+ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) * $(NMETH) - 1 )))
+CNAME   ?= $(TARGET)_cohort_model_$(CSEEDPP)per_r$(CROUNDS)x$(CBATCH)
 # Activate your env and export ES_DATA_DIR before submitting: sbatch passes the submitting
 # environment to the job, so nothing here activates anything.
 
@@ -99,9 +104,11 @@ dry:
 COHORT_SB = -J cohort_al --array=$(ARRAY) -n 1 -N 1 -t $(CTIME) -p $(CPART) --mem=$(CMEM) \
 	    -o cluster/logs/cohort/out_%A_%a.txt -e cluster/logs/cohort/err_%A_%a.txt
 COHORT_WRAP = set -e; export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; \
-	$(PY) -u cohort_al.py --target $(TARGET) --methods $(CMETHOD) --rounds $(CROUNDS) \
-	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 \
-	--first_split $$SLURM_ARRAY_TASK_ID --resume --no_index
+	set -- $(CMETHOD); S=$$(( SLURM_ARRAY_TASK_ID / $(NMETH) )); \
+	shift $$(( SLURM_ARRAY_TASK_ID % $(NMETH) )); M=$$1; \
+	$(PY) -u cohort_al.py --target $(TARGET) --methods $$M --rounds $(CROUNDS) \
+	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 --first_split $$S \
+	--name $(CNAME)_$$M --resume --no_index
 
 submit_cohort:
 	@mkdir -p cluster/logs/cohort
@@ -113,7 +120,8 @@ dry_cohort:
 	@echo 'sbatch $(COHORT_SB) --wrap:'
 	@echo '    $(COHORT_WRAP)'
 	@echo
-	@echo '  -> results/$(TARGET)/full_global/$(TARGET)_cohort_model_$(CSEEDPP)per_r$(CROUNDS)x$(CBATCH)/'
+	@echo '  -> $(CSPLITS) splits x $(NMETH) methods = $(shell echo $$(( $(CSPLITS) * $(NMETH) ))) tasks'
+	@echo '  -> results/$(TARGET)/full_global/$(CNAME)_<method>/   (one folder per method)'
 	@echo '  -> after the array drains: make reindex'
 
 # -------------------------------------------------------------- after a run
