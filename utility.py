@@ -190,6 +190,21 @@ def select_slopes(Z, y, person, n_slopes=5, cols=None, verbose=False):
 
 
 # ----------------------------------------------------------------------------- seed sets
+def block_days(day, W):
+    """-> the day of each BLOCK, from the minute-level day vector.
+
+    `prepare_one` keeps only the per-minute days, W times too long to index blocks with, so
+    seeding "one per day" needs this reconstruction: unique days sorted, ceil(n_d / W) each.
+    """
+    day = np.asarray(day)
+    if W <= 1:
+        return day
+    out = []
+    for d in np.unique(day):
+        out += [d] * int(np.ceil(np.sum(day == d) / W))
+    return np.asarray(out)
+
+
 def seed_set(y, day, rng, n_seed=3, n_seed_pos=1):
     """`n_seed` of one participant's own labels: `n_seed_pos` positives, the rest negatives.
 

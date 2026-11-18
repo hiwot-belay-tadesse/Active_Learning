@@ -40,7 +40,8 @@ from load_data import get_target, load
 from paths import (analysis_path, done_splits, run_dir, split_files, update_index,
                    write_config)
 from preprocess_data import canonical_ids, prepare_one
-from utility import (MixedEffectsClassifier, attach_person, scores, seed_set, select_slopes)
+from utility import (MixedEffectsClassifier, attach_person, block_days, scores, seed_set,
+                     select_slopes)
 
 # ----------------------------------------------------------------------------- defaults
 TARGET = "computer_work"      # change here, or pass --target
@@ -108,24 +109,6 @@ def build_strategy(name, seed, typiclust_k=TYPICLUST_K, eer_candidates=50):
     raise ValueError(f"unknown acquisition {name!r}")
 
 
-def block_days(day, W):
-    """The day of each BLOCK, from the day of each minute. -> (n_blocks,)
-
-    ``tr_day`` is the minute-level vector: ``preprocess_data._block_split`` blocks each side of
-    the split and throws the blocked day vector away, so it is the only one the run carries, and
-    it is 15x too long to index a participant's blocks with. This reconstructs the one
-    ``block_rows`` built -- unique days in sorted order, ceil(n_d / W) blocks within each -- so
-    that "spread the seed over days" means days and not row positions.
-    """
-    day = np.asarray(day)
-    if W <= 1:
-        return day
-    out = []
-    for d in np.unique(day):
-        out += [d] * int(np.ceil(np.sum(day == d) / W))
-    return np.asarray(out)
-
-
 def initial_labels(sp, tgt_uuid, own, tr_day, rng, args):
     """The rows already labelled when round 1 begins. -> (row indices, flagged).
 
@@ -141,7 +124,8 @@ def initial_labels(sp, tgt_uuid, own, tr_day, rng, args):
     the seed's base rate above the real one.
     """
     if args.seed_source == "self":
-        loc, flagged = seed_set(sp.y[own], tr_day[tgt_uuid], rng, args.n_seed, args.n_seed_pos)
+        day = block_days(tr_day[tgt_uuid], args.block)   # per BLOCK, as sp.y[own] is
+        loc, flagged = seed_set(sp.y[own], day, rng, args.n_seed, args.n_seed_pos)
         return own[loc], flagged
     take = []
     for u in sp.users:                       # sp.users is fixed order, so the draw is reproducible

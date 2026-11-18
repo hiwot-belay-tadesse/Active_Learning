@@ -60,7 +60,7 @@ from load_data import get_target, load
 from main import build_strategy
 from paths import done_splits, run_dir, split_files, update_index, write_config
 from preprocess_data import canonical_ids, prepare_one
-from utility import scores, seed_set
+from utility import block_days, scores, seed_set
 
 # Representation strategies come from scikit-activeml, built by main.build_strategy so the two
 # experiments cannot drift apart: `coreset` here is the same CoreSet with the same defaults as
@@ -71,24 +71,6 @@ METHODS = ["uncertainty", "coreset", "typiclust", "probcover", "random"]
 # and refit on the labelled rows itself.
 SKACTIVEML = {"coreset", "typiclust", "probcover"}
 NEEDS_CLF = {"uncertainty"}
-
-
-def block_days(day, W):
-    """-> one day label per BLOCK, from the minute-level day vector.
-
-    ``prepare_one`` blocks each participant's rows W at a time within a day and keeps only the
-    minute-level day vector, which is W times too long to index blocks with. This reconstructs
-    what ``build_pool`` built -- unique days in sorted order, ceil(n_d / W) blocks inside each --
-    so "spread the seed over days" means days. (``main.py``'s self-seeding path passes the
-    unblocked vector straight to ``seed_set``; this script does not reproduce that.)
-    """
-    day = np.asarray(day)
-    if W <= 1:
-        return day
-    out = []
-    for d in np.unique(day):
-        out += [d] * int(np.ceil(np.sum(day == d) / W))
-    return np.asarray(out)
 
 
 def fit_lr(Z, y, args):
