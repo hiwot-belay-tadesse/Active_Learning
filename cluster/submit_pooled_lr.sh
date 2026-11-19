@@ -46,12 +46,14 @@ esac
 # No method left on the command line: this is the login-node pass, so submit one job per method.
 if [ $# -eq 0 ]; then
     mkdir -p cluster/logs/pooled_lr
-    ARRAY=()
-    [ "$BY_SPLIT" = "1" ] && ARRAY=(--array="0-$((N_SPLITS - 1))")
+    # A string, not an array: "${a[@]-}" on an empty array is one EMPTY argument, which sbatch
+    # reads as the script name. Unquoted and empty, this expands to nothing.
+    ARRAY=""
+    [ "$BY_SPLIT" = "1" ] && ARRAY="--array=0-$((N_SPLITS - 1))"
     for m in $METHODS; do
-        echo "sbatch -J plr_${m} ${ARRAY[*]-} $0 ${m}" \
+        echo "sbatch -J plr_${m} ${ARRAY} $0 ${m}" \
             "-> results/${TARGET}/global_lr/${TARGET}_w${BLOCK}_${PREFIX}-${m}_r${ROUNDS}x${BATCH}_s0"
-        [ "${DRY:-0}" = "1" ] || sbatch -J "plr_${m}" "${ARRAY[@]-}" "$0" "${m}"
+        [ "${DRY:-0}" = "1" ] || sbatch -J "plr_${m}" $ARRAY "$0" "${m}"
     done
     echo "when the queue drains:  \$AL_PYTHON paths.py --reindex"
     exit 0
