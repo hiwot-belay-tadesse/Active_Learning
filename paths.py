@@ -56,9 +56,11 @@ def run_id(target, block, methods, rounds, batch, n_slopes, tag=None):
 #   personal     one participant: their own pool, their own model (personal_al.py)
 #   global       one model PER TARGET, personalised, buying from the whole cohort (main.py)
 #   full_global  ONE model for everybody, one acquisition stream for the cohort (cohort_al.py)
+#   global_lr    one PLAIN LR per target, buying from everyone (pooled_lr_al.py) -- main.py's
+#                pool and seed with no personalisation, so the two isolate the model class
 #
 # Discovery accepts a run at either depth, so folders written before this existed keep working.
-SCOPES = ("global", "personal", "full_global")
+SCOPES = ("global", "personal", "full_global", "global_lr")
 
 
 def run_dir(target, block, methods, rounds, batch, n_slopes, tag=None, root=RESULTS_ROOT,
@@ -137,11 +139,20 @@ def figure_path(path, name):
 def write_config(path, args, extra=None):
     """Save every setting beside the numbers, so a run can be read a year later.
 
+    `splits` and `first_split` describe the JOB, not the run: one split per job means twenty
+    array tasks overwrite this file, so the last writer's slice is what survives. `_splits_done`
+    is therefore derived from the CSVs on disk unioned with this job's own range -- never read
+    back from the file, so a lost update cannot shrink it. Read that, or `done_splits()`, and
+    never `splits`.
+
     Versions are included because results depend on them: scikit-activeml's TypiClust default k
     and statsmodels' optimiser have both changed across releases.
     """
     cfg = dict(vars(args)) if hasattr(args, "__dict__") else dict(args)
     cfg.update(extra or {})
+    first = int(cfg.get("first_split") or 0)
+    mine = range(first, first + int(cfg.get("splits") or 1))
+    cfg["_splits_done"] = sorted(set(done_splits(path)) | set(mine))
     cfg["_written"] = time.strftime("%Y-%m-%d %H:%M:%S")
     cfg["_python"] = platform.python_version()
     for mod in ("numpy", "pandas", "sklearn", "statsmodels", "skactiveml"):
@@ -149,14 +160,25 @@ def write_config(path, args, extra=None):
             cfg[f"_{mod}"] = __import__(mod).__version__
         except Exception:
             pass
-    with open(os.path.join(path, "config.json"), "w") as fh:
+    # Atomic: concurrent array tasks sharing this path produced truncated JSON ("}}") before.
+    dst = os.path.join(path, "config.json")
+    tmp = f"{dst}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
         json.dump(cfg, fh, indent=2, default=str)
+    os.replace(tmp, dst)
     return cfg
 
 
 def read_config(path):
+    """-> the config dict. Salvages the trailing garbage a pre-atomic concurrent write left."""
     with open(os.path.join(path, "config.json")) as fh:
-        return json.load(fh)
+        raw = fh.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cfg, end = json.JSONDecoder().raw_decode(raw.lstrip())
+        print(f"  {path}/config.json: ignored {len(raw.lstrip()) - end} trailing byte(s)")
+        return cfg
 
 
 # ----------------------------------------------------------------------------- the index
