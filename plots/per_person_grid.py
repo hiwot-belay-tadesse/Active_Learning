@@ -1,37 +1,12 @@
 """The per-participant grid: one panel per target, the acquisition against random.
 
     python plots/per_person_grid.py                                  # newest computer_work run
-    python plots/per_person_grid.py --target walking
     python plots/per_person_grid.py --run results/computer_work/<run folder> --rows 4
+    python plots/per_person_grid.py --metric auprc --band sd
 
-Each panel is one participant: test AUROC against labels acquired, averaged over the run's
-splits with a +/-1 SE band, the acquisition in purple and random in orange. Panels are ordered
-by the acquisition-random gap at the last round, best first, and the final panel is the mean
-over all targets.
-
-Read the ordering with care. Sorting panels by a noisy quantity always produces a left-to-right
-gradient, so the leading panels look good even when every participant has the same true gap.
-The run summary printed to stdout reports the split-half rank correlation of the per-person
-gap, which is the quick check on whether that ordering means anything: near zero says the
-ranking is luck. The figure itself carries no title -- the series legend sits there instead --
-so the configuration it came from is recorded in the run's ``config.json``, not on the plot.
-
-Two dashed reference lines are drawn per panel when ``analysis/reference_auroc.csv`` exists
-(written by reference_models.py), both fitted on 100% of the split's labels:
-
-  crimson   mixed_full  -- the same mixed-effects model with every label: the personalised
-                           ceiling, what the curve is climbing towards
-  slate     global_prior -- one pooled model for everybody, no random effects, carrying the
-                            same prior as the mixed model's fixed effects: the floor
-                            personalisation is supposed to beat. global_full (the unpenalised
-                            pooled fit) is drawn only with --show_unpenalised, since comparing
-                            against it confounds personalisation with regularisation
-
-A curve below the slate line is a target that personalisation is hurting at this budget; a
-curve reaching the crimson line has nothing left to gain from more labels.
-
-Figures are written inside the run's own ``figures/`` directory, so deleting a run removes
-everything derived from it.
+Panels are ordered by the acquisition-random gap at the last round; the split-half rank
+correlation printed to stdout says whether that ordering means anything. Dashed reference lines
+come from analysis/reference_auroc.csv (reference_models.py), fitted on 100% of the labels.
 """
 import argparse
 import glob
@@ -46,22 +21,18 @@ import numpy as np                                                       # noqa:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import figure_path, find_run, load_run, read_config           # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from palette import METHOD_COLORS                                        # noqa: E402
 
-COL = {"typiclust": "purple", "coreset": "seagreen", "random": "darkorange",
-       "probcover": "dodgerblue", "uncertainty": "steelblue", "eer": "magenta",
-       "laplace": "black", "laplace_var": "gold",
-       # The two cohort-evaluation arms differ from `laplace` ONLY in whose variance is being
-       # reduced, so they are the comparison a reader is here to make; they fell through to the
-       # shared "grey" default and were indistinguishable from each other.
-       "laplace_pool": "teal", "laplace_people": "saddlebrown"}
+COL = dict(METHOD_COLORS)
 
-# Display names. The method STRING stays as it is written in the per-round CSVs and the run
-# folder name -- renaming it there would orphan every finished run -- so the relabelling is
-# cosmetic and lives only here. `--order_by` and `--methods` still take the real name.
+ORDER = ["laplace", "laplace_pool", "laplace_people", "laplace_var", "coreset",
+         "typiclust", "probcover", "uncertainty", "eer", "random"]
+
+# Display names
 LABEL = {"laplace": "EU", "laplace_var": "EU (own variance)",
          "laplace_pool": "EU (cohort, per row)", "laplace_people": "EU (cohort, per person)"}
-# Short names for the reference models, used in the panel titles where the full name would
-# not fit beside its value.
+# short names for the reference models, for the panel titles
 SHORT = {"mixed_full": "mixed", "global_prior": "prior", "global_sklearn": "global",
          "personal_full": "personal",
          "global_full": "unpen"}
@@ -70,15 +41,7 @@ SHORT = {"mixed_full": "mixed", "global_prior": "prior", "global_sklearn": "glob
 def load_refs(runs):
     """-> (frame, where) for the first run that has reference models, else (None, None).
 
-    Searches the primary run and then every `--also` run, because `main.py --refs` is enabled
-    on ONE queue entry (the references depend on the split and the priors, not on the
-    acquisition), so they usually live in a sibling folder rather than the one being plotted.
-
-    A run whose splits were computed by the cluster array holds one
-    ``reference_auroc_split<k>.csv`` per job and no combined file. Those are concatenated here
-    and the result cached as ``reference_auroc.csv``, which is all
-    ``reference_models.py --merge`` does -- no model is fitted, so doing it inline costs
-    nothing and removes a manual step between the array draining and a figure.
+    Searches the primary run then every --also run, and merges per-split CSVs inline.
     """
     import pandas as pd
     for run in runs:
@@ -101,11 +64,7 @@ def load_refs(runs):
 
 
 def split_half_rho(G, n=200, seed=0):
-    """Mean Spearman between per-person gaps scored on two disjoint halves of the splits.
-
-    G is (target x split). With few splits this is noisy itself, so it is reported with the
-    number of splits beside it rather than as a verdict.
-    """
+    """Mean Spearman between per-person gaps on two disjoint halves of the splits."""
     from scipy.stats import spearmanr
     cols = list(G.columns)
     if len(cols) < 4:
@@ -154,6 +113,8 @@ def main():
     ap.add_argument("--no_refs", action="store_true", help="draw the curves only")
     ap.add_argument("--show_unpenalised", action="store_true",
                     help="also draw global_full, the unpenalised pooled fit")
+    ap.add_argument("--band", default="both", choices=["se", "sd", "both"],
+                    help="shaded band over splits: se, sd, or both (default, two figures)")
     ap.add_argument("--ref_models", nargs="*", default=None,
                     help="draw only these reference models, e.g. `--ref_models "
                          "global_sklearn`. Default: all of them that the CSV holds.")
@@ -190,19 +151,10 @@ def main():
     D = load_run(run, "per_round")
     cfg = read_config(run) if os.path.exists(os.path.join(run, "config.json")) else {}
 
-    # `first_split` is deliberately NOT here. Under the cluster fan-out each split is its own
-    # job writing into the shared run folder, and every one of them rewrites config.json with
-    # its own --first_split, so the stored value is whichever job happened to finish last. It
-    # describes no property of the finished run. What actually has to match is the set of
-    # splits present, which is checked below against the CSVs on disk rather than the config.
+    # `first_split` is deliberately NOT here
     SAME = ["target", "block", "n_slopes", "fe_p", "vcp_p", "n_seed", "n_seed_pos",
             "rounds", "batch", "seed", "_seeding"]
-    # `_seeding` is derived, not stored: WHERE the initial labels come from has to be part of
-    # the comparability gate, because `n_seed`/`n_seed_pos` keep their self-path values in a
-    # cohort-seeded config and so cannot distinguish the two. The difference is not small -- on
-    # computer_work the cohort seed starts at AUROC 0.68 against 0.64 for the self seed -- so
-    # merging across it would compare arms that never saw the same initial model. Runs written
-    # before --seed_source existed have no key at all and are self-seeded by construction.
+    # `_seeding` is derived, not stored: where the initial labels come from must match
     def seeding(c):
         src = c.get("seed_source", "self")
         return (src, c.get("n_seed_per_person") if src != "self" else None)
@@ -214,25 +166,18 @@ def main():
     elif a.no_siblings:
         others = []
     else:
-        # Everything beside the primary run. The cluster fan-out writes one folder per method
-        # (run_dir derives the name from the method list), so the siblings ARE the other
-        # acquisitions -- there is nothing for the caller to type that this cannot work out.
+        # Everything beside the primary run
         others = [d for d in sorted(glob.glob(os.path.join(os.path.dirname(run), "*")))
                   if os.path.isdir(d) and os.path.abspath(d) != os.path.abspath(run)
                   and os.path.exists(os.path.join(d, "config.json"))]
     merged, used = [], []
-    # Folders that pass the comparability gate but are NOT drawn (usually because their split
-    # set differs). Their reference fits are still valid for the splits they do cover -- the
-    # references depend on the split and the priors, never on the acquisition -- so they are
-    # kept as a place to look for reference_auroc*.csv, filtered by split below.
+    # Folders that pass the comparability gate but are NOT drawn (usually
     ref_only = []
     for other in others:
         try:
             ocfg = read_config(other)
         except Exception as e:
-            # One folder on disk has a malformed config.json (two concatenated objects), which
-            # used to take the whole figure down and force --no_siblings. A sibling we found
-            # ourselves is skipped; one the caller named is still an error worth stopping for.
+            # One folder on disk has a malformed config.json (two concatenated objects)
             if explicit:
                 raise SystemExit(f"{os.path.basename(other)}: config.json unreadable ({e})")
             print(f"  skipped {os.path.basename(other)}: config unreadable "
@@ -242,7 +187,6 @@ def main():
         bad = [k for k in SAME if cfg.get(k) != ocfg.get(k)]
         if bad:
             # A folder the caller named is a mistake worth stopping for; one we found
-            # ourselves is just a different experiment sitting in the same directory.
             if explicit:
                 raise SystemExit(f"{os.path.basename(other)} differs on {bad}; curves would "
                                  f"not be comparable")
@@ -250,19 +194,14 @@ def main():
         try:
             E = load_run(other, "per_round")
         except FileNotFoundError as e:
-            # A config with no per-round CSVs: a run that was launched and cancelled, or whose
-            # folder was created by --reserve. Nothing to merge, so skip it the same way.
+            # a config with no per-round CSVs: launched and cancelled, or still running
             if explicit:
                 raise SystemExit(f"{os.path.basename(other)}: {e}")
             print(f"  skipped {os.path.basename(other)}: no per-round output")
             continue
         shared = sorted(set(D.split) & set(E.split))
         if set(D.split) != set(E.split):
-            # Every arm has to be averaged over the SAME splits or the gap is not paired, so a
-            # short sibling can only be included by shortening everything else to match. That
-            # is a real cost -- one method whose jobs half-failed would quietly decide how many
-            # splits the whole figure rests on -- so it is done only when the caller named the
-            # folder. A sibling we found ourselves is dropped instead, loudly.
+            # Every arm has to be averaged over the SAME splits or the gap is not paired
             if not explicit:
                 print(f"  skipped {os.path.basename(other)}: has splits "
                       f"{sorted(set(E.split))}, the run has {sorted(set(D.split))}; "
@@ -285,7 +224,9 @@ def main():
     if merged:
         print(f"overlaid {', '.join(merged)} from {len(used)} other run(s): "
               + ", ".join(os.path.basename(u) for u in used))
-    methods = [m for m in D.method.unique()]
+    # fixed order, so the legend reads the same whatever order the sibling runs merged in
+    methods = sorted(D.method.unique(), key=lambda m: ORDER.index(m) if m in ORDER
+                     else len(ORDER))
     if a.methods:
         keep_m = set(a.methods) | {"random"}       # the baseline every gap is measured against
         gone = sorted(set(methods) - keep_m)
@@ -299,13 +240,7 @@ def main():
     alt = a.order_by or next((m for m in methods if m != "random"), None)
     if alt is None or "random" not in methods:
         raise SystemExit(f"need an acquisition and random in the run; found {methods}")
-    # A participant can exhaust their OWN pool before the budget is spent -- personal runs buy
-    # min(batch, remaining) and then stop -- and they hit that wall at a different round in
-    # each split. Leaving the tail in place would quietly change how many splits stand behind
-    # a point partway along that target's curve (20 up to round 8, then 18), so every split of
-    # such a target is cut back to the earliest round any split of theirs stopped at. Nothing
-    # happens to a target whose splits all ran the full budget, which is every target of a
-    # pooled run.
+    # A participant can exhaust their OWN pool before the budget is spent
     cut = D.groupby(["target", "split"])["round"].max().groupby("target").min()
     R = D["round"].max()
     short = cut[cut < R]
@@ -314,9 +249,7 @@ def main():
               + ", ".join(f"{t} at round {int(r)}" for t, r in short.items()))
         D = D[D["round"] <= D.target.map(cut)]
     elif len(short):
-        # --keep_tails: the curve runs as far as any split got, and the tail rests on fewer
-        # splits than the head. Printed per target, because an SE band that narrows or widens
-        # for that reason looks like a property of the acquisition and is not one.
+        # --keep_tails: the curve runs as far as any split got, on fewer splits at the tail
         for t, r in short.items():
             n = (D[(D.target == t) & (D.method == "random")]
                  .groupby("round").split.nunique())
@@ -341,16 +274,14 @@ def main():
     rho = split_half_rho(G)
 
     REF = None
-    # saddlebrown is deliberate: it collides with no acquisition colour in COL above, nor
-    # with crimson/slategrey here or the mediumblue chance line.
-    REFCOL = {"mixed_full": "crimson", "global_prior": "slategrey",
-              "global_sklearn": "darkgreen",
-              # the target's own rows, 100% of their labels -- the ceiling for a personal run,
-              # where mixed_full is a bound a target-only model cannot reach
-              "personal_full": "saddlebrown"}
-    # Distinct dash patterns as well as colours: on a personal grid personal_full and
-    # mixed_full sit close together on several participants, and two dashed lines of similar
-    # length are hard to tell apart at this panel size even in different colours.
+    # No reference shares a colour with an acquisition: saddlebrown is EU's.
+    REFCOL = {"mixed_full": "crimson", "global_prior": "navy",
+              "global_sklearn": "black",
+              # the target's own rows, 100% of their labels: the personal-run ceiling
+              "personal_full": "slategrey"}
+    # Drawn only when named in --ref_models; the pooled prior crowds the panels.
+    OFF_BY_DEFAULT = {"global_prior"}
+    # Distinct dash patterns as well as colours
     REFLS = {"personal_full": "--", "mixed_full": (0, (6, 2, 1, 2)),
              "global_prior": (0, (4, 3)), "global_sklearn": (0, (1, 2)),
              "global_full": (0, (3, 1, 1, 1))}
@@ -363,23 +294,17 @@ def main():
             raise SystemExit(f"unknown reference model(s) {sorted(unknown)}; "
                              f"choose from {sorted(REFCOL)}")
         REFCOL = {k: v for k, v in REFCOL.items() if k in keep}
+    else:
+        REFCOL = {k: v for k, v in REFCOL.items() if k not in OFF_BY_DEFAULT}
     if not a.no_refs:
         if a.refs:                                # an explicit file still wins
             import pandas as pd
             RAW, rpath = pd.read_csv(a.refs), a.refs
         else:
-            # Never `others`: a sibling that failed the COMPARABILITY gate must not supply
-            # ceilings, and load_refs returns the first run with any reference file at all, so
-            # searching blindly let a neighbour fitted under different priors in silently.
-            # `ref_only` is the narrower case -- comparable priors, different SPLIT set -- and
-            # those fits are usable for the splits they cover, so they are searched after the
-            # drawn runs and then filtered to the splits actually plotted, just below.
+            # never `others`: a sibling that failed the comparability gate cannot supply refs
             RAW, rpath = load_refs([run] + used + ref_only)
         if RAW is not None and "split" in RAW.columns:
             # The curves are averaged over set(D.split); a reference averaged over any other
-            # set of splits is a different number. Keep only the plotted splits, and refuse the
-            # file outright if it does not cover all of them rather than drawing a ceiling that
-            # rests on fewer splits than the curve beneath it.
             want = set(D.split)
             RAW = RAW[RAW.split.isin(want)]
             missing = sorted(want - set(RAW.split))
@@ -393,56 +318,42 @@ def main():
                   "<reference_auroc.csv>; drawing curves only")
         else:
             REF = RAW.pivot_table(index="target", columns="model", values=a.metric)
-            # The references are split averages exactly like the curves, so they carry the same
-            # kind of uncertainty and get the same +-1 SE band. Drawing them as bare lines made
-            # a 100%-label ceiling look exact while the curve under it had a visible band.
+            # The references are split averages exactly like the curves
             _n = RAW.pivot_table(index="target", columns="model", values=a.metric,
                                  aggfunc="count")
             _sd = RAW.pivot_table(index="target", columns="model", values=a.metric,
                                   aggfunc="std")
             REFSE = _sd / np.sqrt(_n)
-            # MEAN panel: average over targets WITHIN a split first, then take the SE across
-            # splits -- the same construction the curves use there, so the two are comparable.
+            # MEAN panel: average over targets within a split, then SE across splits
             _ps = RAW.pivot_table(index="split", columns="model", values=a.metric)
             REFM, REFMSE = _ps.mean(), _ps.std(ddof=1) / np.sqrt(_ps.notna().sum())
             if "global_prior" not in REF and "global_full" in REF:     # older runs
-                REFCOL["global_full"] = REFCOL.pop("global_prior", "slategrey")
-            print(f"references: {', '.join(REF.columns)} over "
-                  f"{RAW.split.nunique()} split(s) from {rpath}")
+                REFCOL["global_full"] = REFCOL.pop("global_prior", "navy")
+            drawn = [m for m in REF.columns if m in REFCOL]
+            print(f"references drawn: {', '.join(drawn)}"
+                  + (f"  (in the CSV but off: "
+                     f"{', '.join(m for m in REF.columns if m not in REFCOL)})"
+                     if set(REF.columns) - set(REFCOL) else "")
+                  + f" over {RAW.split.nunique()} split(s) from {rpath}")
 
-    # Chance for AUPRC is the positive rate of the test set, not 0.5, and it differs per
-    # target and per split. Only the reference CSV carries n_test -- per_round_split*.csv
-    # records n_pos_test alone -- so the line is available exactly when references are.
+    # Chance for AUPRC is the positive rate of the test set, not 0.5
     PREV = PLO = PHI = PSD = None
     if a.metric == "auprc" and not a.no_chance:
         if REF is not None and {"n_pos_test", "n_test"} <= set(RAW.columns):
             pv = RAW.drop_duplicates(["split", "target"])
             gp = pv.groupby("target")
-            # POOLED, not the mean of per-split ratios. The splits are day-based, so n_test
-            # swings by up to 10x within one target, and weighting each split equally lets a
-            # small day dominate: M33 reads 0.108 averaged but 0.055 pooled. The curve drawn
-            # above is effectively a size-weighted average too, so pooled is the honest match.
+            # POOLED, not the mean of per-split ratios
             PREV = gp.n_pos_test.sum() / gp.n_test.sum()
-            # The floor itself moves between splits, so a single line claims a precision the
-            # data does not have. The band is +/- 1 SE across splits around the pooled value --
-            # the same convention as every other "+/-" on the figure. (It was the min-max range
-            # before, which is wider by roughly sqrt(n_splits) and is set by two extreme
-            # splits rather than by the spread.)
+            # The floor itself moves between splits
             r = (pv.n_pos_test / pv.n_test).groupby(pv.target)
             _pse = r.std(ddof=1) / np.sqrt(r.count())
             PLO, PHI = PREV - _pse, PREV + _pse
-            # SE across splits, printed beside pi in the title -- the same convention as the
-            # reference values above each panel and the bands around the curves, so every "+/-"
-            # on the figure means one thing. How far the floor actually MOVES between splits is
-            # the shaded min-max band, which is wider by about sqrt(n_splits).
+            # SE across splits, printed beside pi in the title
             PSD = _pse
         else:
             print("chance line: needs n_test from the reference CSV; drawing none")
 
-    # Default: best acquisition gap first. `personalisation` instead ranks by how much the
-    # 100%-label personalised model beats the 100%-label pooled one -- a fixed property of the
-    # participant, computed without reference to any acquisition, so the two orderings answer
-    # different questions and disagreeing is informative rather than a bug.
+    # default: best acquisition gap first; `personalisation` ranks by headroom instead
     if a.order == "personalisation":
         base = next((c for c in ("global_sklearn", "global_prior") if REF is not None
                      and c in REF.columns), None)
@@ -462,120 +373,107 @@ def main():
         order = sorted(gap.index, key=lambda z: int(z[1:])) + ["MEAN"]
     else:
         order = list(gap.index) + ["MEAN"]
+    bands, saved = (["se", "sd"] if a.band == "both" else [a.band]), []
     nrow = a.rows
     ncol = int(np.ceil(len(order) / nrow))
     shy = {"yes": True, "no": False}.get(a.share_y, a.metric == "auroc")
-    fig, axes = plt.subplots(nrow, ncol, figsize=(2.15 * ncol, 2.4 * nrow),
-                             sharex=True, sharey=shy, squeeze=False)
-    for ax, tgt in zip(axes.ravel(), order):
-        d = D if tgt == "MEAN" else D[D.target == tgt]
-        for m in methods:
-            g = d[d.method == m]
-            # Average within a split first, so the SE is across splits in the MEAN panel too.
-            #
-            # Grouped by ROUND, not by `acquired`. They agree whenever every round buys a full
-            # batch, but a participant whose own pool runs out buys a partial one -- the
-            # personal runs do this -- and then that target alone has, say, acquired=23. In a
-            # pivot over `acquired` that column holds ONE target, so the MEAN panel plotted
-            # that single participant's value as if it were the mean of 43, which showed up as
-            # spikes reaching M22's level. Rounds are shared by every target by construction.
-            per = g.pivot_table(index="split", columns="round", values=a.metric)
-            mu = per.mean()
-            se = per.std(ddof=1) / np.sqrt(per.notna().sum())
-            # x stays "labels acquired": the mean over the rows behind each round, which is
-            # exactly round*batch except where a partial batch happened.
-            xs = g.groupby("round").acquired.mean().reindex(mu.index)
-            ax.plot(xs.values, mu.values, color=COL.get(m, "grey"), lw=1.4,
-                    label=LABEL.get(m, m))
-            ax.fill_between(xs.values, mu - se, mu + se, color=COL.get(m, "grey"),
-                            alpha=0.18, lw=0)
-        reftxt = []
-        if REF is not None:
-            for model, colour in REFCOL.items():
-                if model not in REF:
-                    continue
-                if tgt == "MEAN":
-                    v, se = REFM.get(model, np.nan), REFMSE.get(model, np.nan)
-                else:
-                    v, se = REF[model].get(tgt, np.nan), REFSE[model].get(tgt, np.nan)
-                if np.isfinite(v):
-                    ax.axhline(v, color=colour, lw=1.1, ls=REFLS.get(model, "--"),
-                               label=(f"{model} (100% labels)" if tgt == order[0] else None))
-                    # The SE goes in the title rather than a band: at this panel size the
-                    # bands overlapped the curves they were meant to be compared against.
-                    reftxt.append((colour, f"{v:.2f}"
-                                   + (f"$\\pm${se:.2f}" if np.isfinite(se) and se > 0 else "")))
-        pi = np.nan
-        if PREV is not None:
-            pi = PREV.mean() if tgt == "MEAN" else PREV.get(tgt, np.nan)
-            if np.isfinite(pi):
-                # Distinct from every other series: EU black, random orange, the 100%-label
-                # references crimson/grey/gold. This one is not a model -- it is the AP a
-                # constant scorer gets, i.e. the floor the panel should be read against.
-                ax.axhline(pi, color="mediumblue", lw=1.1, ls=":",
-                           label=(r"chance ($\pi$, pooled)" if tgt == order[0] else None))
-            if PLO is not None:
-                lo_, hi_ = ((PLO.mean(), PHI.mean()) if tgt == "MEAN"
-                            else (PLO.get(tgt, np.nan), PHI.get(tgt, np.nan)))
-                if np.isfinite(lo_) and np.isfinite(hi_) and hi_ > lo_:
-                    ax.axhspan(lo_, hi_, color="mediumblue", alpha=0.12, lw=0,
-                               label=(r"$\pi$ $\pm$1 SE over splits" if tgt == order[0]
-                                      else None))
-        # sd of pi across splits, for the title
-        sd = np.nan
-        if PSD is not None and np.isfinite(pi):
-            sd = PSD.mean() if tgt == "MEAN" else PSD.get(tgt, np.nan)
-        sdt = f"$\\pm${sd:.3f}" if np.isfinite(sd) else ""
-        if tgt == "MEAN":
-            pit = "" if not np.isfinite(pi) else f"  $\\pi$={pi:.3f}{sdt}"
-            ax.set_title(f"MEAN (n={D.target.nunique()}){pit}", fontsize=8,
-                         fontweight="bold", pad=14 if reftxt else None)
-        else:
-            pit = "" if not np.isfinite(pi) else f"  ($\\pi$={pi:.3f}{sdt})"
-            # The signed gap is not printed: the panels are already ORDERED by it, best
-            # first, so the position in the grid carries the same information.
-            ax.set_title(f"{tgt}{pit}", fontsize=8, pad=14 if reftxt else None)
-        # Each 100%-label reference's value is written in ITS OWN line colour, just under
-        # the title, so the number identifies the line without a name beside it. Evenly
-        # spaced across the panel width; matplotlib titles cannot colour part of a string,
-        # so these are separate text artists in axes coordinates.
-        for j, (colour, txt) in enumerate(reftxt):
-            ax.text((j + 0.5) / len(reftxt), 1.015, txt, transform=ax.transAxes,
-                    ha="center", va="bottom", fontsize=7, color=colour)
-        if a.metric != "auroc":
-            # Same reason as in per_person_al_and_query: a free AUPRC axis produces
-            # three-decimal labels that are wider than the space between panels.
-            ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
-            ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
-        ax.tick_params(labelsize=7)
-    for ax in axes.ravel()[len(order):]:
-        ax.axis("off")
-    for ax in axes[-1]:
-        ax.set_xlabel("labels acquired", fontsize=8)
-    for ax in axes[:, 0]:
-        ax.set_ylabel(f"test {MET}", fontsize=8)
-    # The legend sits across the top of the figure, where a suptitle would otherwise go, so the
-    # series are named once instead of inside one panel. Handles come from the first panel
-    # because that is the only one given reference-line labels (see the axhline call above).
-    rho_txt = "n/a (<4 splits)" if not np.isfinite(rho) else f"{rho:+.2f}"
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0),
-               ncol=len(labels), fontsize=9, frameon=False)   # one row, left to right
-    # h_pad opens the gap between grid ROWS. The reference values are ax.text artists in
-    # axes coordinates, and tight_layout cannot see those, so without extra room a row's
-    # values print on top of the panel above it.
-    fig.tight_layout(rect=[0, 0, 1, 0.955], h_pad=2.4)
-    sfx = "" if a.metric == "auroc" else f"_{a.metric}"
-    if a.order != "gap":
-        sfx += f"_by{a.order[:4]}"
-    out = figure_path(run, a.out or (f"per_person_grid_merged{sfx}.png" if merged
-                                     else f"per_person_grid{sfx}.png"))
-    fig.savefig(out, dpi=160, bbox_inches="tight", facecolor="white")
+    for band in bands:
+        fig, axes = plt.subplots(nrow, ncol, figsize=(2.15 * ncol, 2.4 * nrow),
+                                 sharex=True, sharey=shy, squeeze=False)
+        for ax, tgt in zip(axes.ravel(), order):
+            d = D if tgt == "MEAN" else D[D.target == tgt]
+            for m in methods:
+                g = d[d.method == m]
+                # Average within a split first, so the SE is across splits in the MEAN panel too
+                per = g.pivot_table(index="split", columns="round", values=a.metric)
+                mu = per.mean()
+                sd = per.std(ddof=1)
+                band_v = sd if band == "sd" else sd / np.sqrt(per.notna().sum())
+                # x stays "labels acquired"
+                xs = g.groupby("round").acquired.mean().reindex(mu.index)
+                ax.plot(xs.values, mu.values, color=COL.get(m, "grey"), lw=1.4,
+                        label=LABEL.get(m, m))
+                ax.fill_between(xs.values, mu - band_v, mu + band_v, color=COL.get(m, "grey"),
+                                alpha=0.18, lw=0)
+            reftxt = []
+            if REF is not None:
+                for model, colour in REFCOL.items():
+                    if model not in REF:
+                        continue
+                    if tgt == "MEAN":
+                        v, se = REFM.get(model, np.nan), REFMSE.get(model, np.nan)
+                    else:
+                        v, se = REF[model].get(tgt, np.nan), REFSE[model].get(tgt, np.nan)
+                    if np.isfinite(v):
+                        ax.axhline(v, color=colour, lw=1.1, ls=REFLS.get(model, "--"),
+                                   label=(f"{model} (100% labels)" if tgt == order[0] else None))
+                        # SE in the title, not a band: a band is unreadable at this panel size
+                        reftxt.append((colour, f"{v:.2f}"
+                                       + (f"$\\pm${se:.2f}" if np.isfinite(se) and se > 0 else "")))
+            pi = np.nan
+            if PREV is not None:
+                pi = PREV.mean() if tgt == "MEAN" else PREV.get(tgt, np.nan)
+                if np.isfinite(pi):
+                    # distinct from every other series: EU black, random orange, refs dashed
+                    ax.axhline(pi, color="mediumblue", lw=1.1, ls=":",
+                               label=(r"chance ($\pi$, pooled)" if tgt == order[0] else None))
+                if PLO is not None:
+                    lo_, hi_ = ((PLO.mean(), PHI.mean()) if tgt == "MEAN"
+                                else (PLO.get(tgt, np.nan), PHI.get(tgt, np.nan)))
+                    if np.isfinite(lo_) and np.isfinite(hi_) and hi_ > lo_:
+                        ax.axhspan(lo_, hi_, color="mediumblue", alpha=0.12, lw=0,
+                                   label=(r"$\pi$ $\pm$1 SE over splits" if tgt == order[0]
+                                          else None))
+            # sd of pi across splits, for the title
+            sd = np.nan
+            if PSD is not None and np.isfinite(pi):
+                sd = PSD.mean() if tgt == "MEAN" else PSD.get(tgt, np.nan)
+            sdt = f"$\\pm${sd:.3f}" if np.isfinite(sd) else ""
+            if tgt == "MEAN":
+                pit = "" if not np.isfinite(pi) else f"  $\\pi$={pi:.3f}{sdt}"
+                ax.set_title(f"MEAN (n={D.target.nunique()}){pit}", fontsize=8,
+                             fontweight="bold", pad=14 if reftxt else None)
+            else:
+                pit = "" if not np.isfinite(pi) else f"  ($\\pi$={pi:.3f}{sdt})"
+                # the signed gap is not printed: the panels are already ordered by it
+                ax.set_title(f"{tgt}{pit}", fontsize=8, pad=14 if reftxt else None)
+            # Each 100%-label reference's value is written in ITS OWN line colour
+            for j, (colour, txt) in enumerate(reftxt):
+                ax.text((j + 0.5) / len(reftxt), 1.015, txt, transform=ax.transAxes,
+                        ha="center", va="bottom", fontsize=7, color=colour)
+            if a.metric != "auroc":
+                # a free AUPRC axis produces three-decimal ticks, so it is left shared
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+                ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+            ax.tick_params(labelsize=7)
+        for ax in axes.ravel()[len(order):]:
+            ax.axis("off")
+        for ax in axes[-1]:
+            ax.set_xlabel("labels acquired", fontsize=8)
+        for ax in axes[:, 0]:
+            ax.set_ylabel(f"test {MET}", fontsize=8)
+        # The legend sits across the top of the figure, where a suptitle would otherwise go
+        rho_txt = "n/a (<4 splits)" if not np.isfinite(rho) else f"{rho:+.2f}"
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0),
+                   ncol=len(labels), fontsize=9, frameon=False)   # one row, left to right
+        # h_pad opens the gap between grid ROWS. The reference values are ax.text artists in axes
+        fig.tight_layout(rect=[0, 0, 1, 0.955], h_pad=2.4)
+        sfx = "" if a.metric == "auroc" else f"_{a.metric}"
+        sfx += "_sd" if band == "sd" else ""
+        if a.order != "gap":
+            sfx += f"_by{a.order[:4]}"
+        out = figure_path(run, a.out or (f"per_person_grid_merged{sfx}.png" if merged
+                                         else f"per_person_grid{sfx}.png"))
+        fig.savefig(out, dpi=160, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        saved.append(out)
     print(f"{nsplit} split(s), {D.target.nunique()} targets, rounds 0-{R}")
     print(f"mean {MET} gap {gap.mean():+.4f} "
           f"(SE {gap.std(ddof=1) / np.sqrt(len(gap)):.4f}), "
           f"{alt} better on {int((gap > 0).sum())}/{len(gap)}; split-half rho {rho_txt}")
-    print("saved", out)
+    for f in saved:
+        print("saved", f)
 
 
 if __name__ == "__main__":
