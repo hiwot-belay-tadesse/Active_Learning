@@ -38,6 +38,11 @@ return the same batch whatever the target. Their curves therefore differ across 
 through the test set, which makes them a useful null -- any spread they show is the spread a
 target-blind acquisition produces for free.
 
+Each split also writes ``analysis/reference_auroc_split<k>.csv``: `pooled_full`, this same LR
+on 100% of the pool's labels, scored per target on the same test rows -- the ceiling the curves
+are climbing towards, in the matched estimator rather than reference_models.py's mixed-effects
+and unpenalised ones. ``--no_refs`` skips it.
+
 Written to main.py's schema -- ``per_round_split<k>.csv`` and ``queries_split<k>.csv`` with the
 same columns, including ``owner`` and ``is_self`` -- so the provenance figures work unchanged.
 Results land under ``results/<target>/global_lr/``, a scope of their own, which also stops
@@ -59,7 +64,8 @@ from sklearn.linear_model import LogisticRegression
 
 from load_data import get_target, load
 from main import build_strategy
-from paths import done_splits, run_dir, split_files, update_index, write_config
+from paths import (analysis_path, done_splits, run_dir, split_files, update_index,
+                   write_config)
 from preprocess_data import canonical_ids, prepare_one
 from utility import block_days, scores
 
@@ -123,6 +129,35 @@ def fit_lr(Z, y, args):
 def decide(clf, Z):
     """-> decision values, or zeros when no model could be fitted."""
     return np.zeros(len(Z)) if clf is None else clf.decision_function(Z)
+
+
+def full_reference(sp, targets, args, split_id):
+    """-> one row per target: THIS run's model, fitted on 100% of the pool's labels.
+
+    The ceiling the curves climb towards, in the matched estimator. `fit_lr` is the same call
+    the AL loop makes every round -- same C, same max_iter, same class_weight, same
+    standardised features -- handed every training label instead of a budget of
+    ``rounds x batch``, and scored on the same held-out days with the same `scores`. So the
+    only thing separating a curve's last point from this line is how many labels were bought,
+    which is what makes the gap readable.
+
+    Pooled LR has no person column and no random effects, so 100% of the labels is ONE fit for
+    the whole cohort: a target gets its own NUMBER here, from its own test rows, but not its
+    own model. There is no per-target variant to compute -- during AL the per-target difference
+    comes entirely from what the acquisition chose to buy, and at full labels nothing is left
+    to buy. Written as reference_auroc_split<k>.csv in reference_models.py's schema, so
+    plots/per_person_grid.py draws it with no extra step.
+    """
+    clf, failed = fit_lr(sp.Z, sp.y, args)
+    rows = []
+    for u in targets:
+        Zte, yte = sp.test_of(u)
+        auroc, auprc = scores(yte, decide(clf, Zte))
+        rows.append(dict(split=split_id, target=sp.ids[u], model="pooled_full",
+                         auroc=auroc, auprc=auprc, n_test=len(yte),
+                         n_pos_test=int(np.sum(yte == 1)), n_train=int(len(sp.y)),
+                         C=args.C, fit_failed=bool(failed)))
+    return pd.DataFrame(rows)
 
 
 def laplace_pick(clf, Z, labelled, cand, eval_rows, batch, args):
@@ -255,6 +290,12 @@ def run_split(data, cols, split_id, args, ids=None):
     if short:
         print(f"    short of quota: {', '.join(short)}", flush=True)
 
+    F = pd.DataFrame()
+    if not args.no_refs:
+        F = full_reference(sp, targets, args, split_id)
+        print(f"    reference (100% of {len(sp.y)} labels): AUROC {F.auroc.mean():.4f}, "
+              f"AUPRC {F.auprc.mean():.4f} over {len(F)} targets", flush=True)
+
     rows, queries = [], []
     for n, u in enumerate(targets, 1):
         r, q = run_target(sp, u, seed_rows, short, args, split_id)
@@ -262,7 +303,7 @@ def run_split(data, cols, split_id, args, ids=None):
         queries += q
         if n % 10 == 0 or n == len(targets):
             print(f"    {n}/{len(targets)} targets, {time.time() - t0:.0f}s", flush=True)
-    return pd.DataFrame(rows), pd.DataFrame(queries), ids
+    return pd.DataFrame(rows), pd.DataFrame(queries), F, ids
 
 
 def main():
@@ -294,6 +335,10 @@ def main():
     ap.add_argument("--name", default=None, help="the folder name outright")
     ap.add_argument("--resume", action="store_true", help="skip splits already written")
     ap.add_argument("--no_index", action="store_true")
+    ap.add_argument("--no_refs", action="store_true",
+                    help="skip the 100%%-label reference fit. It is one extra LR per split, so "
+                         "it is on by default; reference_models.py is not needed for this "
+                         "scope and its mixed/prior models do not match this estimator.")
     ap.add_argument("--out", default=None, help="override the derived folder")
     args = ap.parse_args()
 
@@ -318,13 +363,21 @@ def main():
     for k in range(args.first_split, args.first_split + args.splits):
         if k in have:
             continue
-        R, Q, ids = run_split(data, cols, k, args, ids)
+        R, Q, F, ids = run_split(data, cols, k, args, ids)
         if args.max_targets:
             keep = list(dict.fromkeys(R.target))[:args.max_targets]
             R, Q = R[R.target.isin(keep)], Q[Q.target.isin(keep)]
+            if len(F):
+                F = F[F.target.isin(keep)]
         f_round, f_query = split_files(out, k)
         R.to_csv(f_round, index=False)
         Q.to_csv(f_query, index=False)
+        # A file per split, never one shared file: the fan-out runs one job per split, and
+        # several jobs writing reference_auroc.csv is a read-modify-write race that loses rows
+        # (reference_models.py --merge exists for the same reason). per_person_grid.py merges
+        # reference_auroc_split*.csv itself.
+        if len(F):
+            F.to_csv(analysis_path(out, f"reference_auroc_split{k}.csv"), index=False)
         if not args.no_index:
             update_index(out, cfg)
 
