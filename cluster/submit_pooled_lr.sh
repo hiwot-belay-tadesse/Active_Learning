@@ -5,6 +5,7 @@
 #   ./cluster/submit_pooled_lr.sh --by-split      # job array: one task per split, per method
 #   DRY=1 ./cluster/submit_pooled_lr.sh           # print the commands, submit nothing
 #   METHODS="coreset random" ./cluster/submit_pooled_lr.sh
+#   N_SPLITS=5 PREFIX=try ./cluster/submit_pooled_lr.sh     # any setting below is an env var
 #
 # With no method argument it submits itself once per method; SLURM then re-enters it with the
 # method as $1. Every method gets its own run folder named <PREFIX>-<method>, so no two jobs
@@ -23,13 +24,18 @@ set -euo pipefail
 # ------------------------------------------------------------------ the experiment
 METHODS=${METHODS:-"coreset typiclust probcover random"}
 N_SPLITS=${N_SPLITS:-20}
-PREFIX=${PREFIX:-pooled}          # bump for a new configuration, or old and new splits merge
+# Bump for a new configuration, or old and new splits merge: --resume keys only on which
+# per_round_split*.csv exist and cannot tell that the seeding changed. `pooled` holds the
+# superseded cohort-seeded (2+2 per participant) splits; `selfseed` is the current design.
+PREFIX=${PREFIX:-selfseed}
 TARGET=${TARGET:-computer_work}
 BLOCK=${BLOCK:-15}
 ROUNDS=${ROUNDS:-10}
 BATCH=${BATCH:-3}
-N_SEED_POS=${N_SEED_POS:-2}
-N_SEED_NEG=${N_SEED_NEG:-2}
+# The TARGET's own seed, matching personal_al.py's defaults exactly -- change these and the
+# pool contrast is no longer paired per target.
+N_SEED=${N_SEED:-3}
+N_SEED_POS=${N_SEED_POS:-1}
 C=${C:-1.0}
 SEED=${SEED:-0}
 
@@ -85,7 +91,7 @@ exec "$AL_PYTHON" -u pooled_lr_al.py \
     --first_split "$FIRST" --splits "$HOWMANY" \
     --target "$TARGET" --block "$BLOCK" \
     --rounds "$ROUNDS" --batch "$BATCH" \
-    --n_seed_pos "$N_SEED_POS" --n_seed_neg "$N_SEED_NEG" \
+    --n_seed "$N_SEED" --n_seed_pos "$N_SEED_POS" \
     --C "$C" --seed "$SEED" \
     --resume \
     --no_index
