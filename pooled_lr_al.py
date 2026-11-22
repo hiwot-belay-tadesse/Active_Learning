@@ -8,14 +8,22 @@ no two of them isolate either one:
     cohort_al.py     mixed effects       pool = everyone, ONE model for the cohort
 
 This script is sklearn LR with main.py's pool, which makes `pooled_lr_al.py` vs `main.py` a
-clean model-class contrast (same seed, same pool, same acquisitions) and `pooled_lr_al.py` vs
-`personal_al.py` a clean pool contrast (same model class). The personal-vs-self gap of
--0.033 AUPRC confounds both; this run splits it.
+clean model-class contrast and `pooled_lr_al.py` vs `personal_al.py` a clean POOL contrast:
+same model class, same seed, same budget, and the only thing left differing is who the
+acquisition is allowed to buy from.
 
-    seed      a pair of labels from EACH class for EVERY participant, spread over their days
+    seed      ``n_seed`` of the TARGET's own labels (``n_seed_pos`` positive), spread over days
     pool      every participant's unlabelled training blocks -- the target included
     model     one sklearn LogisticRegression per target, on the labelled rows whoever owns them
     test      the target's held-out days, the same rows main.py and personal_al.py score on
+
+Seeding is personal_al.py's, row for row: `utility.seed_set` over the target's own rows, same
+defaults, same RNG recipe (``[seed, split, pid, 11]``), against the same
+``prepare_one(seed=split)`` division. For a given (split, target) the two runs therefore start
+from the SAME row indices, so their difference is paired per target rather than merely drawn
+from the same distribution. Seeding from the whole cohort instead -- which this script used to
+do -- handed it 172 labels where personal_al.py gets 3, and since the figures plot against
+labels ACQUIRED, that head start sat invisibly beneath every point of the curve.
 
 The model has no person column and no random effects, so nothing in it is personalised: two
 targets differ only in which labels their acquisition chose to buy. That is the point -- it
@@ -39,9 +47,7 @@ through the test set, which makes them a useful null -- any spread they show is 
 target-blind acquisition produces for free.
 
 Each split also writes ``analysis/reference_auroc_split<k>.csv``: `pooled_full`, this same LR
-on 100% of the pool's labels, scored per target on the same test rows -- the ceiling the curves
-are climbing towards, in the matched estimator rather than reference_models.py's mixed-effects
-and unpenalised ones. ``--no_refs`` skips it.
+on 100% of the labels, scored per target -- the matched ceiling. ``--no_refs`` skips it.
 
 Written to main.py's schema -- ``per_round_split<k>.csv`` and ``queries_split<k>.csv`` with the
 same columns, including ``owner`` and ``is_self`` -- so the provenance figures work unchanged.
@@ -67,51 +73,11 @@ from main import build_strategy
 from paths import (analysis_path, done_splits, run_dir, split_files, update_index,
                    write_config)
 from preprocess_data import canonical_ids, prepare_one
-from utility import block_days, scores
+from utility import block_days, scores, seed_set
 
 METHODS = ["laplace", "uncertainty", "coreset", "typiclust", "probcover", "random"]
 SKACTIVEML = {"coreset", "typiclust", "probcover"}
 NEEDS_CLF = {"uncertainty"}
-
-
-def cohort_seed(sp, tr_day, rng, args):
-    """-> (row indices, list of participants short of the quota).
-
-    ``n_seed_pos`` positives and ``n_seed_neg`` negatives from EVERY participant, each class
-    drawn one-per-day over that participant's distinct days before any day is used twice -- the
-    same day-spreading `seed_set` does, applied per class. 2+2 x 43 participants is 172 labels,
-    all 43 people represented, every one of them with both classes present.
-
-    Class balance is imposed here, unlike main.py's ``--seed_source cohort``, which takes
-    ``n_seed_per_person`` blocks regardless of label. A per-person pair from each class is what
-    makes the starting model comparable across targets: no target begins with a cohort that
-    happens to be missing positives.
-    """
-    take, short = [], []
-    for u in sp.users:
-        rows = sp.rows_of(u)
-        if not len(rows):
-            continue
-        day = block_days(tr_day[u], args.block)
-        assert len(day) == len(rows), f"{len(day)} block days for {len(rows)} blocks of {u}"
-        got = []
-        for cls, want in ((1, args.n_seed_pos), (0, args.n_seed_neg)):
-            pick_from = rows[sp.y[rows] == cls]
-            if len(pick_from) < want:
-                short.append(f"{sp.ids[u]}:{int(cls)}={len(pick_from)}")
-            d_of = day[sp.y[rows] == cls]
-            chosen = []
-            for d in rng.permutation(np.unique(d_of)):       # one per day first
-                chosen.append(rng.choice(pick_from[d_of == d]))
-                if len(chosen) >= want:
-                    break
-            rest = np.setdiff1d(pick_from, chosen)
-            if want > len(chosen) and len(rest):
-                chosen += list(rng.choice(rest, min(want - len(chosen), len(rest)),
-                                          replace=False))
-            got += list(chosen)
-        take += got
-    return np.array(sorted(set(take)), dtype=int), short
 
 
 def fit_lr(Z, y, args):
@@ -132,21 +98,9 @@ def decide(clf, Z):
 
 
 def full_reference(sp, targets, args, split_id):
-    """-> one row per target: THIS run's model, fitted on 100% of the pool's labels.
+    """-> one row per target: `fit_lr` on 100% of the labels, scored on the same test rows.
 
-    The ceiling the curves climb towards, in the matched estimator. `fit_lr` is the same call
-    the AL loop makes every round -- same C, same max_iter, same class_weight, same
-    standardised features -- handed every training label instead of a budget of
-    ``rounds x batch``, and scored on the same held-out days with the same `scores`. So the
-    only thing separating a curve's last point from this line is how many labels were bought,
-    which is what makes the gap readable.
-
-    Pooled LR has no person column and no random effects, so 100% of the labels is ONE fit for
-    the whole cohort: a target gets its own NUMBER here, from its own test rows, but not its
-    own model. There is no per-target variant to compute -- during AL the per-target difference
-    comes entirely from what the acquisition chose to buy, and at full labels nothing is left
-    to buy. Written as reference_auroc_split<k>.csv in reference_models.py's schema, so
-    plots/per_person_grid.py draws it with no extra step.
+    Pooled LR has nothing target-specific, so full labels give ONE fit, one number per target.
     """
     clf, failed = fit_lr(sp.Z, sp.y, args)
     rows = []
@@ -158,6 +112,16 @@ def full_reference(sp, targets, args, split_id):
                          n_pos_test=int(np.sum(yte == 1)), n_train=int(len(sp.y)),
                          C=args.C, fit_failed=bool(failed)))
     return pd.DataFrame(rows)
+
+
+def refs_for_split(data, cols, split_id, args, ids=None):
+    """-> (reference frame, ids) for one split, fitting nothing else.
+
+    What --refs_only uses to add the reference to a run whose curves are already on disk.
+    """
+    sp, ids, _ = prepare_one(data, cols, seed=split_id, W=args.block, ids=ids)
+    targets = [u for u in sp.users if np.sum(sp.yte[u] == 1) >= args.min_test_pos]
+    return full_reference(sp, targets, args, split_id), ids
 
 
 def laplace_pick(clf, Z, labelled, cand, eval_rows, batch, args):
@@ -232,12 +196,24 @@ def build_query(method, seed, args):
     return build_strategy(method, seed, args.typiclust_k), None
 
 
-def run_target(sp, tgt_uuid, seed_rows, short, args, split_id):
-    """One target's curves, every method from the shared cohort seed. -> (rows, queries)."""
+def run_target(sp, tgt_uuid, tr_day, args, split_id):
+    """One target's curves, every method from THAT TARGET's own seed.
+
+    -> (rows, queries, seed was short of positives). The seed is personal_al.py's row for row,
+    which is what makes the pool the only difference between the two runs.
+    """
     pid = sp.ids[tgt_uuid]
     own = sp.rows_of(tgt_uuid)
+    rng = np.random.default_rng([args.seed, split_id, int(pid[1:]), 11])
+    day = block_days(tr_day[tgt_uuid], args.block)
+    assert len(day) == len(own), f"{len(day)} block days for {len(own)} blocks of {pid}"
+    loc, flagged = seed_set(sp.y[own], day, rng, args.n_seed, args.n_seed_pos)
+    seed_rows = own[loc]
+
     Zte, yte = sp.test_of(tgt_uuid)
     n_pos_te = int(np.sum(yte == 1))
+    # Keyed on the target as well as the split, and NOT drawn from `rng` above, so a method's
+    # position in --methods cannot change what it buys.
     strat_seed = int(np.random.default_rng(
         [args.seed, split_id, int(pid[1:]), 7]).integers(2 ** 31))
 
@@ -273,22 +249,16 @@ def run_target(sp, tgt_uuid, seed_rows, short, args, split_id):
                              self_share=(float(np.mean([sp.owner[i] == tgt_uuid
                                                         for i in bought]))
                                          if bought else np.nan),
-                             fit_failed=bool(failed), seed_flagged=bool(short)))
-    return rows, queries
+                             fit_failed=bool(failed), seed_flagged=bool(flagged)))
+    return rows, queries, flagged
 
 
 def run_split(data, cols, split_id, args, ids=None):
     t0 = time.time()
     sp, ids, (tr_day, _) = prepare_one(data, cols, seed=split_id, W=args.block, ids=ids)
-    # One seed set for the whole split: every target starts from the same labelled cohort, so
-    # the only thing separating two targets is what their acquisition went on to buy.
-    rng = np.random.default_rng([args.seed, split_id, 11])
-    seed_rows, short = cohort_seed(sp, tr_day, rng, args)
     targets = [u for u in sp.users if np.sum(sp.yte[u] == 1) >= args.min_test_pos]
-    print(f"  split {split_id}: {sp}, {len(targets)} targets, {len(seed_rows)} seed labels "
-          f"({int(np.sum(sp.y[seed_rows] == 1))} positive)", flush=True)
-    if short:
-        print(f"    short of quota: {', '.join(short)}", flush=True)
+    print(f"  split {split_id}: {sp}, {len(targets)} targets, {args.n_seed} own seed labels "
+          f"each ({args.n_seed_pos} positive)", flush=True)
 
     F = pd.DataFrame()
     if not args.no_refs:
@@ -296,13 +266,17 @@ def run_split(data, cols, split_id, args, ids=None):
         print(f"    reference (100% of {len(sp.y)} labels): AUROC {F.auroc.mean():.4f}, "
               f"AUPRC {F.auprc.mean():.4f} over {len(F)} targets", flush=True)
 
-    rows, queries = [], []
+    rows, queries, short = [], [], []
     for n, u in enumerate(targets, 1):
-        r, q = run_target(sp, u, seed_rows, short, args, split_id)
+        r, q, flagged = run_target(sp, u, tr_day, args, split_id)
         rows += r
         queries += q
+        if flagged:
+            short.append(sp.ids[u])
         if n % 10 == 0 or n == len(targets):
             print(f"    {n}/{len(targets)} targets, {time.time() - t0:.0f}s", flush=True)
+    if short:
+        print(f"    too few positives for a full seed: {', '.join(short)}", flush=True)
     return pd.DataFrame(rows), pd.DataFrame(queries), F, ids
 
 
@@ -316,10 +290,10 @@ def main():
     ap.add_argument("--first_split", type=int, default=0)
     ap.add_argument("--rounds", type=int, default=10)
     ap.add_argument("--batch", type=int, default=3, help="labels bought per round")
-    ap.add_argument("--n_seed_pos", type=int, default=2,
-                    help="positive seed labels per participant")
-    ap.add_argument("--n_seed_neg", type=int, default=2,
-                    help="negative seed labels per participant")
+    ap.add_argument("--n_seed", type=int, default=3,
+                    help="the TARGET's own initial labels. personal_al.py's default; it has to "
+                         "match there, or the pool contrast is not paired")
+    ap.add_argument("--n_seed_pos", type=int, default=1, help="how many of them are positive")
     ap.add_argument("--typiclust_k", type=int, default=20)
     ap.add_argument("--uncertainty_method", default="least_confident",
                     choices=["least_confident", "margin_sampling", "entropy"])
@@ -336,22 +310,33 @@ def main():
     ap.add_argument("--resume", action="store_true", help="skip splits already written")
     ap.add_argument("--no_index", action="store_true")
     ap.add_argument("--no_refs", action="store_true",
-                    help="skip the 100%%-label reference fit. It is one extra LR per split, so "
-                         "it is on by default; reference_models.py is not needed for this "
-                         "scope and its mixed/prior models do not match this estimator.")
+                    help="skip the 100%%-label reference. One extra LR per split, so it is on "
+                         "by default and reference_models.py is not needed for this scope.")
+    ap.add_argument("--refs_only", action="store_true",
+                    help="write ONLY the reference for an existing run and exit, leaving its "
+                         "curves alone. Needs --name/--out, and block and C must match it.")
     ap.add_argument("--out", default=None, help="override the derived folder")
     args = ap.parse_args()
 
     t = get_target(args.target)
     args.target = t.name
     out = args.out or run_dir(t.name, args.block, args.methods, args.rounds, args.batch,
-                              0, tag=args.tag, scope="global_lr", name=args.name)
-    os.makedirs(out, exist_ok=True)
-    cfg = write_config(out, args, extra=dict(model="sklearn_logistic", pool="cohort",
-                                             seed_source="cohort_balanced",
-                                             seed_rule="pair_per_class_per_person"))
+                              0, tag=args.tag, scope="global_lr", name=args.name,
+                              create=not args.refs_only)
+    # --refs_only writes no config: the folder already has one, and rewriting it from these
+    # args would change the keys per_person_grid.py gates sibling folders on.
+    cfg = None
+    if args.refs_only:
+        if not os.path.exists(os.path.join(out, "config.json")):
+            raise SystemExit(f"--refs_only needs a finished run; no config.json in {out}\n"
+                             f"  name it: --name <folder under results/<target>/global_lr/>")
+    else:
+        os.makedirs(out, exist_ok=True)
+        cfg = write_config(out, args, extra=dict(model="sklearn_logistic", pool="cohort",
+                                                 seed_source="self",
+                                                 seed_rule="own_rows_day_spread"))
     print(f"{t.name}: pooled LR, {' vs '.join(args.methods)}, W={args.block}, "
-          f"{args.n_seed_pos}+{args.n_seed_neg} seed per person + {args.rounds} x {args.batch} "
+          f"{args.n_seed} own seed + {args.rounds} x {args.batch} "
           f"= {args.rounds * args.batch} acquired, {args.splits} split(s)")
     print(f"  -> {out}", flush=True)
 
@@ -360,6 +345,17 @@ def main():
     if have:
         print(f"  resuming: splits {have} already written", flush=True)
     ids = canonical_ids(data)
+    if args.refs_only:
+        for k in range(args.first_split, args.first_split + args.splits):
+            dst = analysis_path(out, f"reference_auroc_split{k}.csv")
+            if args.resume and os.path.exists(dst):
+                continue
+            F, ids = refs_for_split(data, cols, k, args, ids)
+            F.to_csv(dst, index=False)
+            print(f"  split {k}: reference AUROC {F.auroc.mean():.4f}, "
+                  f"AUPRC {F.auprc.mean():.4f} over {len(F)} targets", flush=True)
+        return
+
     for k in range(args.first_split, args.first_split + args.splits):
         if k in have:
             continue
@@ -372,10 +368,8 @@ def main():
         f_round, f_query = split_files(out, k)
         R.to_csv(f_round, index=False)
         Q.to_csv(f_query, index=False)
-        # A file per split, never one shared file: the fan-out runs one job per split, and
-        # several jobs writing reference_auroc.csv is a read-modify-write race that loses rows
-        # (reference_models.py --merge exists for the same reason). per_person_grid.py merges
-        # reference_auroc_split*.csv itself.
+        # One file per split, never a shared one: concurrent jobs would race on it.
+        # per_person_grid.py merges reference_auroc_split*.csv itself.
         if len(F):
             F.to_csv(analysis_path(out, f"reference_auroc_split{k}.csv"), index=False)
         if not args.no_index:
