@@ -5,6 +5,8 @@
 #   make submit ONLY=eu_split0            one job from the QUEUE, to test the setup
 #   make submit_cohort                    cohort_al.py to SLURM, one array task per split
 #   make dry_cohort                       print that sbatch line, submit nothing
+#   make submit_frozen                    frozen_mixed_al.py to SLURM, split x method array
+#   make dry_frozen                       print those sbatch lines, submit nothing
 #   make local                            the whole QUEUE in this shell (DRYRUN path)
 #   make dry                              print what would be submitted, submit nothing
 #   make refs RUN=<folder>                100%-label reference models for a finished run
@@ -57,10 +59,10 @@ CMETHOD ?= laplace_pool coreset typiclust probcover random
 CTIME   ?= 0-12:00
 CPART   ?= shared
 CMEM    ?= 16000
-# One task per (split, method): id = split * NMETH + method index. Each method gets its own
-# run folder, which the grid merges automatically (it globs the sibling folders).
+# One sbatch per method, each an array over the splits: `squeue` then shows the methods
+# separately and a slow one can be cancelled or resubmitted on its own.
 NMETH   := $(words $(CMETHOD))
-ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) * $(NMETH) - 1 )))
+ARRAY   ?= 0-$(shell echo $$(( $(CSPLITS) - 1 )))
 CNAME   ?= $(TARGET)_cohort_model_$(CSEEDPP)per_r$(CROUNDS)x$(CBATCH)
 # Activate your env and export ES_DATA_DIR before submitting: sbatch passes the submitting
 # environment to the job, so nothing here activates anything.
@@ -69,13 +71,13 @@ TAGFLAG := $(if $(TAG),--tag $(TAG),)
 ONLYFLAG := $(if $(ONLY),--only $(ONLY),)
 RUNFLAG := $(if $(RUN),--run $(RUN),--contains r$(ROUNDS)x$(BATCH))
 
-.PHONY: help run submit submit_cohort dry_cohort local dry refs python sweep grid bar reindex selftest clean-logs
+.PHONY: help run submit submit_cohort dry_cohort submit_frozen dry_frozen local dry refs python sweep grid bar reindex selftest clean-logs
 
 python:
 	@echo $(PY)
 
 help:
-	@sed -n '2,21p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '2,23p' Makefile | sed 's/^# \{0,1\}//'
 
 # -------------------------------------------------------------------- running
 run:
@@ -96,33 +98,94 @@ local:
 dry:
 	$(PY) cluster/submit_batch.py --dry $(ONLYFLAG)
 
-# Split in two so both targets share one definition and `dry_cohort` can echo the body
-# verbatim: the body deliberately contains no single quotes, so '$(COHORT_WRAP)' is safe to
-# quote in the recipe and to print. BLAS is pinned to one thread (the job holds one core and
-# would otherwise spawn a thread per visible CPU) and --no_index keeps concurrent tasks off
-# results/index.csv -- run `make reindex` once the array has drained.
-COHORT_SB = -J cohort_al --array=$(ARRAY) -n 1 -N 1 -t $(CTIME) -p $(CPART) --mem=$(CMEM) \
-	    -o cluster/logs/cohort/out_%A_%a.txt -e cluster/logs/cohort/err_%A_%a.txt
+# Defined once so `submit_cohort` and `dry_cohort` cannot drift and the dry run echoes the
+# body verbatim. The recipes DOUBLE-quote it -- `$$M` has to expand to the loop's method -- so
+# the body contains no double quotes, and SLURM's own variable is escaped (`\$$`) to survive
+# into --wrap and be expanded by the job instead. BLAS is pinned to one thread (the job holds
+# one core and would otherwise spawn a thread per visible CPU) and --no_index keeps concurrent
+# tasks off results/index.csv -- run `make reindex` once the arrays have drained.
 COHORT_WRAP = set -e; export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; \
-	set -- $(CMETHOD); S=$$(( SLURM_ARRAY_TASK_ID / $(NMETH) )); \
-	shift $$(( SLURM_ARRAY_TASK_ID % $(NMETH) )); M=$$1; \
 	$(PY) -u cohort_al.py --target $(TARGET) --methods $$M --rounds $(CROUNDS) \
-	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 --first_split $$S \
-	--name $(CNAME)_$$M --resume --no_index
+	--batch $(CBATCH) --n_seed_per_person $(CSEEDPP) --splits 1 \
+	--first_split \$$SLURM_ARRAY_TASK_ID --name $(CNAME)_$$M --resume --no_index
 
 submit_cohort:
-	@mkdir -p cluster/logs/cohort
 	@test -n "$$ES_DATA_DIR" || echo 'WARNING: ES_DATA_DIR is unset -- the job will not find the CSVs'
 	@echo "submitting with $(PY)"
-	sbatch $(COHORT_SB) --wrap '$(COHORT_WRAP)'
+	@for M in $(CMETHOD); do \
+	  mkdir -p cluster/logs/cohort/$$M; \
+	  sbatch -J cohort_$$M --array=$(ARRAY) -n 1 -N 1 -t $(CTIME) -p $(CPART) \
+	    --mem=$(CMEM) -o cluster/logs/cohort/$$M/out_%A_%a.txt \
+	    -e cluster/logs/cohort/$$M/err_%A_%a.txt \
+	    --wrap "$(COHORT_WRAP)"; \
+	done
 
 dry_cohort:
-	@echo 'sbatch $(COHORT_SB) --wrap:'
-	@echo '    $(COHORT_WRAP)'
+	@for M in $(CMETHOD); do \
+	  echo "sbatch -J cohort_$$M --array=$(ARRAY) -t $(CTIME) -p $(CPART) --mem=$(CMEM) --wrap:"; \
+	  echo "    $(COHORT_WRAP)"; \
+	done
 	@echo
-	@echo '  -> $(CSPLITS) splits x $(NMETH) methods = $(shell echo $$(( $(CSPLITS) * $(NMETH) ))) tasks'
+	@echo '  -> $(NMETH) submissions x $(CSPLITS) splits'
 	@echo '  -> results/$(TARGET)/full_global/$(CNAME)_<method>/   (one folder per method)'
-	@echo '  -> after the array drains: make reindex'
+	@echo '  -> after the arrays drain: make reindex'
+
+# frozen_mixed_al.py -- mixed effects with the POPULATION FROZEN after the seed fit. Like
+# cohort_al.py it is a separate entry point, so cluster/run.py's QUEUE -- which expands a grid
+# and calls main.py -- cannot carry it, and `submit_frozen` sbatches it directly instead.
+#
+# Two dimensions, split differently on purpose: one array task per SPLIT (the unit of
+# parallelism everywhere in this repo, so no two jobs touch one file), and one SUBMISSION per
+# method, because run_id names the folder after the sorted method list -- so a per-method
+# submission puts each arm in its own folder, which is what pooled_lr_al.py's runs already do
+# and what the plotting scripts glob. It also lets one slow arm be resubmitted alone.
+#
+# Cost: one task is 43 targets x 11 rounds of (43 ridge GLMs x <=50 EM iterations), measured at
+# ~3 min locally plus the data load, so 0-01:00 is already generous. --n_slopes 0 (every feature
+# gets a random slope, the literal specification) is minutes PER TARGET in step 1 alone -- raise
+# FTIME to 0-12:00 before trying that.
+FSPLITS ?= 20
+FROUNDS ?= 10
+FBATCH  ?= 3
+FSEEDPC ?= 1
+FSLOPES ?= 5
+FMETHOD ?= coreset typiclust probcover uncertainty random
+FTIME   ?= 0-01:00
+FPART   ?= shared
+FMEM    ?= 8000
+FARRAY  ?= 0-$(shell echo $$(( $(FSPLITS) - 1 )))
+FEXTRA  ?=
+NFMETH  := $(words $(FMETHOD))
+
+# Defined once so `submit_frozen` and `dry_frozen` cannot drift, and quoted on the same terms as
+# COHORT_WRAP: the recipes double-quote it, so the body holds no double quotes, and SLURM's own
+# variable is escaped (\$$) to survive into --wrap and be expanded by the job.
+FROZEN_WRAP = set -e; export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; \
+	$(PY) -u frozen_mixed_al.py --target $(TARGET) --block $(BLOCK) --methods $$M \
+	--rounds $(FROUNDS) --batch $(FBATCH) --n_seed_per_class $(FSEEDPC) \
+	--n_slopes $(FSLOPES) --splits 1 --first_split \$$SLURM_ARRAY_TASK_ID --resume --no_index \
+	$(FEXTRA)
+
+submit_frozen:
+	@test -n "$$ES_DATA_DIR" || echo 'WARNING: ES_DATA_DIR is unset -- the job will not find the CSVs'
+	@echo "submitting with $(PY)"
+	@for M in $(FMETHOD); do \
+	  mkdir -p cluster/logs/frozen/$$M; \
+	  sbatch -J frozen_$$M --array=$(FARRAY) -n 1 -N 1 -t $(FTIME) -p $(FPART) \
+	    --mem=$(FMEM) -o cluster/logs/frozen/$$M/out_%A_%a.txt \
+	    -e cluster/logs/frozen/$$M/err_%A_%a.txt \
+	    --wrap "$(FROZEN_WRAP)"; \
+	done
+
+dry_frozen:
+	@for M in $(FMETHOD); do \
+	  echo "sbatch -J frozen_$$M --array=$(FARRAY) -t $(FTIME) -p $(FPART) --mem=$(FMEM) --wrap:"; \
+	  echo "    $(FROZEN_WRAP)"; \
+	done
+	@echo
+	@echo '  -> $(NFMETH) submissions x $(FSPLITS) splits = $(shell echo $$(( $(NFMETH) * $(FSPLITS) ))) tasks'
+	@echo '  -> results/$(TARGET)/$(TARGET)_w$(BLOCK)_<method>_r$(FROUNDS)x$(FBATCH)_s$(FSLOPES)_frozenmixed/'
+	@echo '  -> after the arrays drain: make reindex'
 
 # -------------------------------------------------------------- after a run
 # Jobs run with --no_index to keep concurrent writers off results/index.csv; this rebuilds it
