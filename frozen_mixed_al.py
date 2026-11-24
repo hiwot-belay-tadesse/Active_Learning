@@ -87,6 +87,31 @@ Outputs, in the run folder
     queries_split<k>.csv     main.py's schema: every bought row and whose it was
     labels_split<k>.csv      round x participant label counts  (spec: "labels per participant")
     state_split<k>.csv       round x term: sigma2 and u_t      (spec: "sigma2, u_t")
+    analysis/reference_auroc_split<k>.csv   `frozen_full`, the matched 100%-label ceiling
+
+The ceiling, and why it has to be this one
+------------------------------------------
+``frozen_full`` is this same model given every label in the cohort pool: the SAME frozen
+population -- step 1 rerun from the same target-keyed seed draw, so it is the identical offset
+the curves ran under -- then step 4's EM over all participants' full training rows and step 5
+for the target. It is the limit the AL curve is climbing towards, the point where buying one
+more label changes nothing, so the vertical distance to it reads as budget alone.
+
+It is an ASYMPTOTE, not an upper bound, and a curve can cross it. The population is frozen from
+an 86-row seed set; where that offset is a poor fit for a participant, more labels move ``u``
+further in a direction that serves the training rows and not the held-out days. A curve sitting
+above its own ceiling is that, and it is a finding about the freezing -- not a broken figure.
+
+``reference_models.py``'s ``mixed_full`` is NOT that ceiling. It refits the population on every
+label, and the whole point of this file is that the population never moves after step 1; a
+frozen curve read against it is read against a different estimator. ``--no_update_variances`` is
+honoured too, so a ``_fixedvar`` run gets a ``_fixedvar`` ceiling and the pair stays comparable.
+
+The reference is written per split and is ON by default -- it reuses the step-1 fit the target
+already paid for, so it costs one full-label EM per (split, target) and nothing else.
+``--no_refs`` skips it; ``--refs_only`` writes it for a run whose curves are already on disk and
+exits, which is how folders that predate this code get a ceiling without rerunning any
+acquisition.
 
 Checks
 ------
@@ -108,7 +133,8 @@ from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
 
 from load_data import get_target, load
 from main import build_strategy
-from paths import done_splits, run_dir, split_files, update_index, write_config
+from paths import (analysis_path, done_splits, run_dir, split_files, update_index,
+                   write_config)
 from preprocess_data import Split, canonical_ids, prepare_one
 from utility import (attach_person, block_days, feature_names, frame, scores, seed_set,
                      select_slopes, vc_formulas)
@@ -497,11 +523,94 @@ def assert_no_test_leak(sp, uuid, rows, test_keys):
                      f"{sp.ids.get(uuid, uuid)}: {bad[:5]}")
 
 
+def seed_and_population(sp, uuid, days_of, slope_idx, args, split_id, cols=None,
+                        verbose=False):
+    """Steps 1-2 for one target. -> (seed_rows, skipped, population).
+
+    Factored out because TWO things need the identical frozen population: the curves, and the
+    100%%-label ceiling they are read against. Recomputing the seed draw in two places is how a
+    ceiling silently stops capping the curve it is drawn over -- the RNG is keyed on
+    ``(seed, split, participant)``, so the draw is reproducible, and that only helps if both
+    callers reproduce it the same way.
+    """
+    pid = sp.ids[uuid]
+    rng = np.random.default_rng([args.seed, split_id, int(pid[1:]), 11])
+    seed_rows, skipped = cohort_seed(sp, days_of, rng, args.n_seed_per_class)
+    pop = population_fit(sp.Z[seed_rows], sp.y[seed_rows], sp.pid[seed_rows], slope_idx,
+                         fe_p=args.fe_p, vcp_p=args.vcp_p, cols=cols, verbose=verbose)
+    return seed_rows, skipped, pop
+
+
+# ============================================================ the 100%-label ceiling
+def frozen_full_row(sp, uuid, pop, args, split_id, seed_rows=()):
+    """-> one ``frozen_full`` row: this model with EVERY label in the pool. See the docstring.
+
+    Steps 3-5 exactly as :meth:`FrozenMixed.fit` runs them, with the labelled set taken to be
+    the whole training matrix: every participant's own rows form their group, the EM variance
+    update runs over all of them, and the target is scored from its own ``u`` at the converged
+    ``sigma2``. Nothing here touches a test row -- ``sp.Z`` holds training rows only.
+
+    ``update_variances`` is honoured rather than assumed, so the ceiling matches the run: with
+    step 4 off, sigma2 stays at step 1's and each participant is fitted independently, which is
+    the limit of THAT experiment and not of the other one.
+    """
+    D, eta = pop.design(sp.Z), pop.eta(sp.Z)
+    groups = {}
+    for person in sp.users:                       # fixed order -> reproducible EM
+        rows = sp.rows_of(person)
+        if len(rows):
+            groups[person] = (D[rows], sp.y[rows], eta[rows])
+    if args.update_variances:
+        sigma2, iters, u, rel = em_sigma2(groups, pop.sigma2, args.em_iter, args.em_tol,
+                                          args.solver)
+    else:
+        sigma2, iters, rel = np.asarray(pop.sigma2, float), 0, 0.0
+        u = {q: adjust(*groups[q], sigma2, solver=args.solver)[0] for q in groups}
+    u_t = u.get(uuid)
+    if u_t is None:                                                  # pragma: no cover
+        u_t = np.zeros(1 + len(pop.slope_idx))
+    Zte, yte = sp.test_of(uuid)
+    auroc, auprc = scores(yte, pop.eta(Zte) + pop.design(Zte) @ u_t)
+    return dict(split=split_id, target=sp.ids[uuid], model="frozen_full",
+                auroc=auroc, auprc=auprc, n_test=int(len(yte)),
+                n_pos_test=int(np.sum(yte == 1)), n_train=int(len(sp.y)),
+                n_own_train=int(len(sp.rows_of(uuid))), n_persons_labeled=len(groups),
+                em_iters=int(iters), em_rel=float(rel), sigma2_int=float(sigma2[0]),
+                update_variances=bool(args.update_variances),
+                fit_failed=bool(pop.failed), n_seed=int(len(seed_rows)))
+
+
+def full_reference(sp, targets, days_of, slope_idx, args, split_id, cols=None):
+    """-> a frame of ``frozen_full`` rows, refitting step 1 per target.
+
+    What ``--refs_only`` uses on a run whose curves are already written. Inside a live run the
+    ceiling is computed in :func:`run_target` instead, off the population that target has
+    already paid for -- same number, one fewer step-1 fit.
+    """
+    rows = []
+    for n, u in enumerate(targets, 1):
+        seed_rows, _skipped, pop = seed_and_population(sp, u, days_of, slope_idx, args,
+                                                       split_id, cols=cols, verbose=n == 1)
+        rows.append(frozen_full_row(sp, u, pop, args, split_id, seed_rows))
+    return pd.DataFrame(rows)
+
+
+def refs_for_split(data, cols, split_id, args, ids=None):
+    """-> (reference frame, ids) for one split, running no acquisition at all."""
+    sp, ids, (tr_day, _) = prepare_one(data, cols, seed=split_id, W=args.block, ids=ids)
+    slope_idx = slopes_for(sp, cols, args)
+    days_of = {u: block_days(tr_day[u], args.block) for u in sp.users}
+    targets = [u for u in sp.users if np.sum(sp.yte[u] == 1) >= args.min_test_pos]
+    if args.max_targets:
+        targets = targets[:args.max_targets]
+    return full_reference(sp, targets, days_of, slope_idx, args, split_id, cols=cols), ids
+
+
 # ===================================================================================== the loop
 def run_target(sp, uuid, days_of, slope_idx, args, split_id, cols=None, verbose=False):
     """One target's curves, every method from the same seed set and the same frozen population.
 
-    -> (per_round rows, query rows, label-count rows, state rows)
+    -> (per_round rows, query rows, label-count rows, state rows, reference rows)
 
     Everything is re-initialised from step 1 for this target: its own seed draw (the RNG is
     keyed on the target), its own population fit, its own variances. Nothing carries over from
@@ -514,11 +623,8 @@ def run_target(sp, uuid, days_of, slope_idx, args, split_id, cols=None, verbose=
     """
     pid = sp.ids[uuid]
     own = sp.rows_of(uuid)
-    rng = np.random.default_rng([args.seed, split_id, int(pid[1:]), 11])
-    seed_rows, skipped = cohort_seed(sp, days_of, rng, args.n_seed_per_class)
-
-    pop = population_fit(sp.Z[seed_rows], sp.y[seed_rows], sp.pid[seed_rows], slope_idx,
-                         fe_p=args.fe_p, vcp_p=args.vcp_p, cols=cols, verbose=verbose)
+    seed_rows, skipped, pop = seed_and_population(sp, uuid, days_of, slope_idx, args, split_id,
+                                                  cols=cols, verbose=verbose)
     # Step 2, materialised for every window of every participant, as specified -- and asserted
     # to equal what Population.eta recomputes, which is what the model actually calls.
     eta_pool = pop.eta(sp.Z)
@@ -536,6 +642,11 @@ def run_target(sp, uuid, days_of, slope_idx, args, split_id, cols=None, verbose=
     Xclf = attach_person(sp.Z, sp.owner, sp.users)
     Xte = attach_person(Zte, [uuid] * len(yte), sp.users)
     Xte_as_target = Xte                      # the target's own code: its random effect applies
+
+    # The ceiling first, off the population just fitted: it does not depend on the acquisition,
+    # so it is one fit per target rather than one per (target, method).
+    refs = ([] if getattr(args, "no_refs", False)
+            else [frozen_full_row(sp, uuid, pop, args, split_id, seed_rows)])
 
     rows, queries, labels, state = [], [], [], []
     for method in args.methods:
@@ -591,7 +702,7 @@ def run_target(sp, uuid, days_of, slope_idx, args, split_id, cols=None, verbose=
             for k, term in enumerate(pop.terms):
                 state.append(dict(split=split_id, target=pid, method=method, round=rnd,
                                   term=term, sigma2=float(clf.sigma2_[k]), u_t=float(u_t[k])))
-    return rows, queries, labels, state
+    return rows, queries, labels, state, refs
 
 
 def build_query(method, seed, args):
@@ -649,7 +760,7 @@ def run_split(data, cols, split_id, args, ids=None):
         targets = targets[:args.max_targets]
     print(f"  split {split_id}: {sp}, {len(targets)} targets", flush=True)
 
-    out = ([], [], [], [])
+    out = ([], [], [], [], [])
     for n, u in enumerate(targets, 1):
         got = run_target(sp, u, days_of, slope_idx, args, split_id, cols=cols, verbose=n == 1)
         for dst, src in zip(out, got):
@@ -752,17 +863,39 @@ def self_test():
         update_variances=True, em_iter=EM_ITER, em_tol=EM_TOL, solver="newton", fe_p=FE_P,
         vcp_p=VCP_P, typiclust_k=20, uncertainty_method="least_confident",
         uncertainty_coding="owner", batch_size=None)
-    R, Q, L, S = run_target(sp, sp.users[0], days, [0, 1, 2, 3], args, 0, cols=sp.cols)
-    R, Q, L, S = pd.DataFrame(R), pd.DataFrame(Q), pd.DataFrame(L), pd.DataFrame(S)
+    R, Q, L, S, F = run_target(sp, sp.users[0], days, [0, 1, 2, 3], args, 0, cols=sp.cols)
+    R, Q, L, S, F = (pd.DataFrame(R), pd.DataFrame(Q), pd.DataFrame(L), pd.DataFrame(S),
+                     pd.DataFrame(F))
     print(R[["method", "round", "n_labeled", "n_persons_labeled", "em_iters", "em_rel",
              "auroc", "auprc", "self_share"]].to_string(index=False))
     print(f"   sigma2 at the last round:\n"
           f"{S[S['round'] == S['round'].max()].to_string(index=False)}")
     assert len(R) == 2 * (args.rounds + 1) and Q.target.nunique() == 1
     assert len(L) and len(S), "the per-participant and sigma2 logs are empty"
-    print("   OK: steps 1-5 run end to end and the four logs are written\n")
+    assert len(F) == 1 and F.model.iloc[0] == "frozen_full", "no ceiling row came back"
+    print(f"   ceiling: frozen_full AUROC {F.auroc.iloc[0]:.4f} AUPRC {F.auprc.iloc[0]:.4f} "
+          f"on all {int(F.n_train.iloc[0])} labels vs {int(R.n_labeled.max())} bought")
+    print("   OK: steps 1-5 run end to end and the five logs are written\n")
 
-    print("4. --no_update_variances really closes the channel")
+    print("5. the ceiling --refs_only writes is the one the run would have written")
+    # --refs_only refits step 1 from the seed draw instead of reusing the population the curves
+    # ran under, so it is only sound if the draw reproduces. The SEED SET is checked exactly --
+    # it is ours, keyed on (seed, split, participant), and a changed rule would otherwise show
+    # up nowhere until a figure quietly capped its curves with the wrong number. The SCORE is
+    # checked to a tolerance instead: statsmodels' fit_vb is not bit-reproducible (two calls on
+    # identical input differ by ~1e-6 in beta on COMPUTER_WORK), which is a property of step 1
+    # and applies to rerunning the curves themselves just as much.
+    rows_a = seed_and_population(sp, sp.users[0], days, [0, 1, 2, 3], args, 0, cols=sp.cols)[0]
+    rows_b = seed_and_population(sp, sp.users[0], days, [0, 1, 2, 3], args, 0, cols=sp.cols)[0]
+    assert np.array_equal(rows_a, rows_b), "the seed draw is not reproducible"
+    F2 = full_reference(sp, [sp.users[0]], days, [0, 1, 2, 3], args, 0, cols=sp.cols)
+    d = float(abs(F2.auroc.iloc[0] - F.auroc.iloc[0]))
+    print(f"   same seed set ({len(rows_a)} rows); run_target {F.auroc.iloc[0]:.9f} vs "
+          f"refs_only {F2.auroc.iloc[0]:.9f} (|diff| {d:.1e})")
+    assert d < 1e-4, "--refs_only does not reproduce the population the curves ran under"
+    print("   OK\n")
+
+    print("6. --no_update_variances really closes the channel")
     args.update_variances = False
     R2 = pd.DataFrame(run_target(sp, sp.users[0], days, [0, 1, 2, 3], args, 0, cols=sp.cols)[3])
     v = R2[(R2.method == "random") & (R2.term == "int")].sigma2.unique()
@@ -810,6 +943,18 @@ def main():
                     help="whose random effect a candidate is scored under")
     ap.add_argument("--min_test_pos", type=int, default=1)
     ap.add_argument("--max_targets", type=int, default=0, help="debug: stop after N targets")
+    ap.add_argument("--no_refs", action="store_true",
+                    help="skip the 100%%-label ceiling `frozen_full`. It reuses the step-1 fit "
+                         "the target already paid for, so it is one extra full-label EM per "
+                         "(split, target) and is on by default; reference_models.py is not a "
+                         "substitute (see the module docstring).")
+    ap.add_argument("--refs_only", action="store_true",
+                    help="write ONLY analysis/reference_auroc_split<k>.csv for a run whose "
+                         "curves are already on disk, then exit. Nothing else in the folder is "
+                         "touched and no config is rewritten, so a finished fan-out can be "
+                         "given its ceiling without rerunning any acquisition. Needs --out (or "
+                         "the same flags the run was launched with, so the folder name derives "
+                         "to the same place).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--reserve", action="store_true")
@@ -830,14 +975,25 @@ def main():
     tag = "frozenmixed" + (f"_{args.tag}" if args.tag else "")
     tag += "" if args.update_variances else "_fixedvar"
     out = args.out or run_dir(t.name, args.block, args.methods, args.rounds, args.batch,
-                              args.n_slopes, tag=tag, reserve=args.reserve, scope=None)
-    os.makedirs(out, exist_ok=True)
-    cfg = write_config(out, args, extra=dict(model="frozen_mixed_effects", pool="cohort",
-                                             seed_source="cohort_one_per_class"))
+                              args.n_slopes, tag=tag, reserve=args.reserve, scope=None,
+                              create=not args.refs_only)
+    # --refs_only rewrites no config: the folder already has one, and rewriting it from these
+    # args would move the keys per_person_grid.py gates sibling folders on.
+    cfg = None
+    if args.refs_only:
+        if not os.path.exists(os.path.join(out, "config.json")):
+            raise SystemExit(f"--refs_only needs a finished run; no config.json in {out}\n"
+                             f"  name the folder with --out <path>")
+    else:
+        os.makedirs(out, exist_ok=True)
+        cfg = write_config(out, args, extra=dict(model="frozen_mixed_effects", pool="cohort",
+                                                 seed_source="cohort_one_per_class"))
     print(f"{t.name}: frozen-population mixed effects, {' vs '.join(args.methods)}, "
           f"W={args.block}, {args.n_seed_per_class}/class/participant seed + "
           f"{args.rounds} x {args.batch} acquired, {args.splits} split(s)")
-    print(f"  step 4 {'ON' if args.update_variances else 'OFF'}, solver {args.solver}")
+    print(f"  step 4 {'ON' if args.update_variances else 'OFF'}, solver {args.solver}, "
+          f"ceiling {'OFF' if args.no_refs else 'frozen_full'}"
+          + (" (REFS ONLY: no acquisition)" if args.refs_only else ""))
     print(f"  -> {out}", flush=True)
 
     data, cols = load(t, verbose=True)
@@ -845,21 +1001,41 @@ def main():
     if have:
         print(f"  resuming: splits {have} already written", flush=True)
     ids = canonical_ids(data)
+    if args.refs_only:
+        for k in range(args.first_split, args.first_split + args.splits):
+            dst = analysis_path(out, f"reference_auroc_split{k}.csv")
+            if args.resume and os.path.exists(dst):
+                print(f"  split {k}: reference already written, skipping", flush=True)
+                continue
+            t0 = time.time()
+            F, ids = refs_for_split(data, cols, k, args, ids)
+            F.to_csv(dst, index=False)
+            print(f"  split {k}: frozen_full AUROC {F.auroc.mean():.4f}, "
+                  f"AUPRC {F.auprc.mean():.4f} over {len(F)} targets "
+                  f"in {time.time() - t0:.0f}s -> {dst}", flush=True)
+        print(f"done -> {out}")
+        return
+
     for k in range(args.first_split, args.first_split + args.splits):
         if k in have:
             continue
-        R, Q, L, S, ids = run_split(data, cols, k, args, ids)
+        R, Q, L, S, F, ids = run_split(data, cols, k, args, ids)
         f_round, f_query = split_files(out, k)
         R.to_csv(f_round, index=False)
         Q.to_csv(f_query, index=False)
         L.to_csv(os.path.join(out, f"labels_split{k}.csv"), index=False)
         S.to_csv(os.path.join(out, f"state_split{k}.csv"), index=False)
+        # One file per split, never a shared one: concurrent array tasks would race on it.
+        # plots/per_person_grid.py merges reference_auroc_split*.csv itself.
+        if len(F):
+            F.to_csv(analysis_path(out, f"reference_auroc_split{k}.csv"), index=False)
         if not args.no_index:
             update_index(out, cfg)
         last = R[R["round"] == R["round"].max()]
         print(f"  split {k}: round {int(last['round'].iloc[0])} AUPRC "
               + ", ".join(f"{m} {g.auprc.mean():.4f}"
-                          for m, g in last.groupby("method")), flush=True)
+                          for m, g in last.groupby("method"))
+              + (f"  | frozen_full {F.auprc.mean():.4f}" if len(F) else ""), flush=True)
     if not args.no_index:
         update_index(out, cfg)
     print(f"done -> {out}")
